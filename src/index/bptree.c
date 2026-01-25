@@ -174,19 +174,19 @@ int bptree_search(bptree* tree, int key, long* out_value) {
  */
 int bptree_contains(bptree* tree, int key) {
     if (tree == NULL || tree->root == NULL)
-        return 0;
+        return BPTREE_ERR;
 
     bptree_node* leaf = bptree_find_leaf(tree, key);
     if (leaf == NULL)
-        return 0;
+        return BPTREE_ERR;
 
     for (int i = 0; i < leaf->key_count; i++) {
         if (leaf->keys[i] == key)
-            return 1;
+            return BPTREE_OK;
         if (leaf->keys[i] > key)
             break;
     }
-    return 0;
+    return BPTREE_ERR;
 }
 
 /**
@@ -241,11 +241,23 @@ int bptree_insert(bptree* tree, int key, long value) {
 
     // 唯一一次重复 key 判断
     int flag = bptree_contains(tree, key);
-    if (flag) {
-        fprintf(stderr, "键 %d 已存在，插入失败！\n", key);
-        return BPTREE_ERR;
+    if (flag == BPTREE_OK) {
+        // fprintf(stderr, "键 %d 已存在，插入失败！\n", key);
+        // return BPTREE_ERR;
+        ;
     }
 
+    // 1. 查找 key 是否已经在叶子节点中
+    for (int i = 0; i < leaf->key_count; i++) {
+        if (leaf->keys[i] == key) {
+            // --- 关键修改：如果找到了，直接更新 value 并返回 ---
+            leaf->values[i] = value;
+            printf("键 %d 已存在，已更新值为 %ld\n", key, value);
+            return BPTREE_OK;
+        }
+    }
+
+    // 2. 如果没找到，再走原来的插入/分裂逻辑
     // 叶子节点有空间，直接插入
     if (leaf->key_count < MAX_KEYS) {
         bptree_insert_into_leaf(leaf, key, value);
