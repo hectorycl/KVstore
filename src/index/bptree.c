@@ -19,8 +19,8 @@
 #define MAX_CHILDREN ORDER
 #define MIN_KEYS ((MAX_KEYS + 1) / 2)
 
-#define BPTREE_OK 0
-#define BPTREE_ERR -1
+// #define BPTREE_OK 0
+// #define BPTREE_ERR -1
 
 // ================== 类型定义（内部） ==================
 typedef struct _bptree_node {
@@ -78,6 +78,10 @@ static void bptree_print_level_bfs(bptree_node* root);
 
 // ========== 销毁（内部） ==========
 static void bptree_destroy_node(bptree_node* node);
+
+// =========== KV 相关操作  ===========
+static bptree_node* bptree_leafmost_leaf(bptree* tree);
+int bptree_scan(bptree* tree, bptree_leaf_visit_fn visit, void* arg);
 
 // 创建一个新的 B+ 树节点
 bptree_node* bptree_create_node(int is_leaf) {
@@ -1351,4 +1355,44 @@ void bptree_destroy(bptree* tree) {
 
     bptree_destroy_node(tree->root);
     free(tree);
+}
+
+// =============== KV ============
+/**
+ * 找到最左叶子节点（工具函数）
+ *
+ */
+static bptree_node* bptree_leafmost_leaf(bptree* tree) {
+    bptree_node* node = tree->root;
+    if (!node) return NULL;
+
+    while (!node->is_leaf) {
+        node = node->children[0];
+    }
+
+    // node is children
+
+    return node;
+}
+
+/**
+ * 地毯式搜索
+ *  - 日志压缩的核心（Compaction）: 只管在“地表”横向移动
+ */
+int bptree_scan(bptree* tree, bptree_leaf_visit_fn visit, void* arg) {
+    if (!tree || !visit) return -1;  // BPTREE_ERR = -1
+
+    bptree_node* leaf = bptree_leftmost_leaf(tree);
+    while (leaf) {
+        for (int i = 0; i < leaf->key_count; i++) {
+            // 回调调用，每一条数据都会被扔给 visit
+            // 如果 visit 返回非0，scan会立刻停止遍历，这给了调用者控制权
+            int ret = visit(leaf->keys[i], leaf->values[i], arg);
+            if (ret != 0) return 0;  // BPTREE_OK = 0
+        }
+
+        leaf = leaf->next;
+    }
+
+    return 0;
 }
