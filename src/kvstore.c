@@ -1,8 +1,41 @@
 #include "kvstore.h"
 
+#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// ======== 内部结构体的定义 =======
+struct _kvstore {
+    bptree* tree;  // B+ 树指针
+
+    FILE* log_fp;  // 日志文件指针
+    char log_path[256];
+
+    kvstore_mode_t mode;
+
+    size_t log_size;   // 当前日志大小（字节）
+    size_t ops_count;  // 自上次 compaction 以来的操作次数
+
+    /*  0：正常模式
+        1：只读模式（replay 中）
+    */
+    int readonly;  // 是否处于只读模式（replay / recovery）
+};
+// API 层用
+#define RETURN_API_ERR(code) \
+    do {                     \
+        store->readonly = 1; \
+        return (code);       \
+    } while (0)
+
+// 内部逻辑用
+#define RETURN_ERR(code) \
+    do {                 \
+        return (code);   \
+    } while (0)
 
 static int kvstore_open_log(kvstore* store, const char* path);
 static int kvstore_replay_log(kvstore* store);
@@ -10,44 +43,53 @@ static int kvstore_log_put(kvstore* store, int key, long value);
 static int kvstore_log_del(kvstore* store, int key);
 static int kvstore_load_snapshot(kvstore* store);
 static int kvstore_create_snapshot(kvstore* store);
-static int kvstore_snapshot_exists(const char* path);
-static uint32_t crc32(const char* s);
-static int kvstore_check_log_header(FILE* fp);
-static int kvstore_replay_log(kvstore* store);
+// static int kvstore_snapshot_exists(const char* path);
+static int kvstore_log_header(const char* line);
+static int kvstore_apply_put_internal(bptree* tree, int key, long value, kvstore_mode_t mode);  // mode 是为了识别模式，重放模式下不打印
+static int kvstore_apply_del_internal(bptree* tree, int key);
+const char* kvstore_strerror(int err);
+static void kvstore_maybe_compact(kvstore* store);
 static int kvstore_apply_put(kvstore* store, int key, long value);
 static int kvstore_apply_del(kvstore* store, int key);
-const char* kvstore_strerror(int err);
-// ========  public API (对外)  ==========
-int kvstore_put(kvstore* store, int key, long value);
-int kvstore_del(kvstore* store, int key);
+
+uint32_t crc32(const char* s);
 
 // 创建 KVstore
 kvstore* kvstore_create(const char* log_path) {
-    kvstore* store = (kvstore*)malloc(sizeof(kvstore));  // 分配内存
-    if (!store) {
-        perror("malloc kvstore");
-        exit(EXIT_FAILURE);
-    }
+    kvstore* store = malloc(sizeof(*store));
+    if (!store) return NULL;
 
-    store->tree = bptree_create();
+    /* 1. 初始化为可 destroy 状态 */
+    store->tree = NULL;
     store->log_fp = NULL;
     store->log_size = 0;
     store->ops_count = 0;
+    store->mode = KVSTORE_MODE_NORMAL;
+    store->readonly = 0;
 
-    /* 1. 先加载 snapshot*/
+    /* 2. 创建 B+ 树 */
+    store->tree = bptree_create();
+    if (!store->tree) goto fail;
+
+    /* 3. 加载 snapshot（允许不存在） */
     kvstore_load_snapshot(store);
 
-    /* 2. 再打开日志 */
-    if (kvstore_open_log(store, log_path) != 0) {
-        free(store);
-        return NULL;
+    /* 4. 打开 WAL（内部负责写 header） */
+    if (kvstore_open_log(store, log_path) != KVSTORE_OK) {
+        goto fail;
     }
 
-    // 数据回复发生在 B+ 树创建之后，对用户透明
-    /* 3. replay snapshot 之后的 WAL */
-    kvstore_replay_log(store);
+    /* 5. replay WAL（现在 log_fp 一定合法） */
+    if (kvstore_replay_log(store) != KVSTORE_OK) {
+        fprintf(stderr, "[DEBUG] replay failed\n");
+        goto fail;
+    }
 
     return store;
+
+fail:
+    kvstore_destroy(store);
+    return NULL;
 }
 
 /**
@@ -74,105 +116,24 @@ kvstore* kvstore_create(const char* log_path) {
  *
  */
 void kvstore_destroy(kvstore* store) {
-    if (!store) return;
+    if (!store) {
+        return;
+    }
 
+    /* 1. 关闭 WAL 日志 */
     if (store->log_fp) {
         fclose(store->log_fp);
+        store->log_fp = NULL;
     }
 
-    bptree_destroy(store->tree);
+    /* 2. 销毁 B+ 树 */
+    if (store->tree) {
+        bptree_destroy(store->tree);
+        store->tree = NULL;
+    }
+
+    /* 3. 释放 store 本体 */
     free(store);
-
-    return;
-}
-
-/**
- * 内部使用：只修改内存结构，不写 WAL
- *  - 无论是重放旧日志，还是正常写入，最终都要调用它
- *  - Replay 期间，数据库正是处于 readonly 模式，此处不能检查 readonly !!!
- *      否则，启动恢复时所有的旧数据都会被拦截，导致恢复失败
- */
-static int kvstore_apply_put(kvstore* store, int key, long value) {
-    if (!store || !store->tree) return KVSTORE_ERR_NULL;
-
-    int ret = bptree_insert(store->tree, key, value);
-    if (ret != BPTREE_OK) {
-        return KVSTORE_ERR_INTERNAL;
-    }
-
-    return KVSTORE_OK;
-}
-
-/**
- * 内部使用：del
- */
-static int kvstore_apply_del(kvstore* store, int key) {
-    if (!store || !store->tree) return KVSTORE_ERR_NULL;
-
-    int ret = bptree_delete(store->tree, key);
-    if (ret != BPTREE_OK) {
-        return KVSTORE_ERR_NOT_FOUND;
-    }
-
-    return KVSTORE_OK;
-}
-
-/**
- * API: 对外 PUT
- * 先 WAL, 再 apply
- *  - WAL 已落盘 -> replay 可恢复
- *  - apply 只在内存 -> 可重做
- */
-int kvstore_put(kvstore* store, int key, long value) {
-    if (!store) return KVSTORE_ERR_NULL;
-
-    /*启动
-        → replay 日志（readonly = 1）
-        → replay 结束（readonly = 0）
-        → 正常 PUT / DEL
-    */
-    // 只读模式不能修改 put ? todo
-    if (store->readonly) {
-        return KVSTORE_ERR_READONLY;
-    }
-
-    // 1. 先写 WAL (Write-Ahead Log)
-    if (kvstore_log_put(store, key, value) != 0) {
-        return KVSTORE_ERR_IO;
-    }
-
-    // 2. 再写修改内容
-    int ret = kvstore_apply_put(store, key, value);
-    if (ret != 0) {
-        return KVSTORE_ERR_CORRUPTED;
-    }
-
-    // 3. 统计信息
-    store->ops_count++;
-
-    return KVSTORE_OK;
-}
-
-/**
- * API: del
- */
-int kvstore_del(kvstore* store, int key) {
-    if (!store) return KVSTORE_ERR_NULL;
-
-    // 检查模式
-    if (store->readonly) {
-        return KVSTORE_ERR_READONLY;
-    }
-
-    if (kvstore_log_del(store, key) != 0) {
-        return KVSTORE_ERR_IO;
-    }
-
-    int ret = kvstore_apply_del(store, key);
-    if (ret != 0) return KVSTORE_ERR_INTERNAL;
-
-    store->ops_count++;
-    return KVSTORE_OK;
 }
 
 // 插入数据到 KVstore
@@ -189,7 +150,7 @@ int kvstore_insert(kvstore* store, int key, long value) {
     }
 
     // 4. 再应用到内存（Apply）- 落实
-    if (kvstore_apply_put(store, key, value) != KVSTORE_OK) {
+    if (kvstore_apply_put_internal(store->tree, key, value, store->mode) != KVSTORE_OK) {
         return KVSTORE_ERR_INTERNAL;
     }
 
@@ -202,11 +163,35 @@ int kvstore_insert(kvstore* store, int key, long value) {
 
 // 查找数据
 int kvstore_search(kvstore* store, int key, long* value) {
+    fprintf(stderr, "[DEBUG] before search, tree=%p\n", store->tree);
     return bptree_search(store->tree, key, value);
 }
 
-// 删除数据
-int kvstore_delete(kvstore* store, int key) {
+/**
+ * API: 对外 PUT
+ * 先 WAL, 再 apply
+ *  - WAL 已落盘 -> replay 可恢复
+ *  - apply 只在内存 -> 可重做
+ */
+int kvstore_put(kvstore* store, int key, long value) {
+    if (!store)
+        return KVSTORE_ERR_NULL;
+
+    if (store->mode != KVSTORE_MODE_NORMAL)
+        return KVSTORE_ERR_READONLY;
+
+    if (kvstore_log_put(store, key, value) != KVSTORE_OK)
+        return KVSTORE_ERR_IO;
+
+    store->ops_count++;
+    kvstore_maybe_compact(store);
+    return kvstore_apply_put(store, key, value);
+}
+
+/**
+ * API: del
+ */
+int kvstore_del(kvstore* store, int key) {
     // 1. 基础检查
     if (!store) return KVSTORE_ERR_NULL;
 
@@ -216,17 +201,48 @@ int kvstore_delete(kvstore* store, int key) {
     // 3. 先写日志（WAL）
     if (kvstore_log_del(store, key) != 0) return KVSTORE_ERR_IO;
 
-    // 4. 应用到内存（Apply）
-    int ret = kvstore_apply_del(store->tree, key);
-    if (ret != 0) {
-        return KVSTORE_ERR_INTERNAL;
-    }
-
-    // 5. 维护工作
     store->ops_count++;
     kvstore_maybe_compact(store);
 
-    return ret;
+    return kvstore_apply_del(store, key);
+}
+
+// apply 层，只负责“把一次 PUT 应用到内存”
+static int kvstore_apply_put(kvstore* store, int key, long value) {
+    if (!store || !store->tree) return KVSTORE_ERR_NULL;
+    return kvstore_apply_put_internal(store->tree, key, value, store->mode);
+}
+
+static int kvstore_apply_del(kvstore* store, int key) {
+    if (!store || !store->tree) return KVSTORE_ERR_NULL;
+    return kvstore_apply_del_internal(store->tree, key);
+}
+
+/**
+ * 内部使用：只修改内存结构，不写 WAL
+ *  - 无论是重放旧日志，还是正常写入，最终都要调用它
+ *  - Replay 期间，数据库正是处于 readonly 模式，此处不能检查 readonly !!!
+ *      否则，启动恢复时所有的旧数据都会被拦截，导致恢复失败
+ */
+static int kvstore_apply_put_internal(bptree* tree, int key, long value, kvstore_mode_t mode) {
+    if (!tree) return KVSTORE_ERR_NULL;
+
+    // fprintf(stderr, "[REPLAY] apply PUT %d = %ld\n", key, value);
+    return bptree_insert(tree, key, value);
+    int ret = bptree_insert(tree, key, value);
+    if (ret == BPTREE_OK && mode == KVSTORE_MODE_NORMAL) {
+        // 只有在非重放模式下才打印
+        printf("键 %d 已存在，已更新值为 %ld\n", key, value);
+    }
+}
+
+/**
+ * 内部使用：del
+ */
+static int kvstore_apply_del_internal(bptree* tree, int key) {
+    if (!tree) return KVSTORE_ERR_NULL;
+
+    return bptree_delete(tree, key);
 }
 
 /**
@@ -244,56 +260,29 @@ int kvstore_delete(kvstore* store, int key) {
  * perror - 自动打印失败的具体原因
  *  */
 static int kvstore_open_log(kvstore* store, const char* path) {
+    if (!store || !path) return KVSTORE_ERR_NULL;
+
+    FILE* fp = fopen(path, "a+");  // a+: 不存在则创建， 存在则读写
+    if (!fp) {
+        perror("fopen log failed");
+        return KVSTORE_ERR_IO;
+    }
+
+    store->log_fp = fp;
     snprintf(store->log_path, sizeof(store->log_path), "%s", path);
 
-    // 日志初始化（第一次创建）
-    if (ftell(store->log_fp) == 0) {
-        fprintf(store->log_fp, "KVSTORE_LOG_V1\n");
-        fflush(store->log_fp);
+    // 明确跳到文件末尾，判断大小
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+
+    if (size == 0) {
+        // 第一次创建日志，写 header
+        fprintf(fp, "%s\n", KVSTORE_LOG_VERSION);
+        fflush(fp);
     }
 
-    store->log_fp = fopen(path, "a+");
-    if (!store->log_fp) {
-        perror("fopen log file");
-        return -1;
-    }
-
-    return KVSTORE_OK;
-}
-
-/**
- * 日志重放（replay）
- *
- * rewind - 把文件的读取+指针（光标） 重置到文件开头（a+ 模式打开， 默认在文件末尾）
- * fgets  - 从文件中读取一行，直到换行符 \n 或者读满了255个字符
- * sscanf - 从字符串里提取数据吗，返回成功汽配并复制的变量个数
- *          scanf(...): 从键盘输入（标准输入）读取。
- *          fscanf(fp, ...): 直接从文件读取。
- *          sscanf(str, ...): 从内存中的字符串读取
- *
- *
- */
-static int kvstore_replay_log(kvstore* store) {
-    if (!store || !store->log_fp) return KVSTORE_ERR_NULL;
-
-    char line[256];
-
-    // a+ 模式下，文件指针默认在末尾
-    rewind(store->log_fp);
-
-    while (fgets(line, sizeof(line), store->log_fp)) {
-        int key;
-        long value;
-
-        if (sscanf(line, "PUT %d %ld", &key, &value) == 2) {
-            kvstore_apply_put(store->tree, key, value);
-        } else if (sscanf(line, "DEL %d", &key) == 1) {
-            kvstore_apply_del(store->tree, key);
-        } else {
-            // 忽略格式错误的行
-            continue;
-        }
-    }
+    // replay 前统一从头开始读
+    fseek(fp, 0, SEEK_SET);
 
     return KVSTORE_OK;
 }
@@ -306,10 +295,10 @@ static int kvstore_log_put(kvstore* store, int key, long value) {
     if (!store->log_fp) return KVSTORE_ERR_NULL;
 
     char buf[128];
-    int len = snprintf(buf, sizeof(buf), "PUT %d %ld", key, value);
+    snprintf(buf, sizeof(buf), "PUT %d %ld", key, value);
     uint32_t crc = crc32(buf);
 
-    int bytes = fprintf(store->log_fp, "%s | %u\n", buf, crc);
+    int bytes = fprintf(store->log_fp, "%s|%u\n", buf, crc);
     fflush(store->log_fp);
 
     store->ops_count += 1;
@@ -326,10 +315,10 @@ static int kvstore_log_del(kvstore* store, int key) {
     if (!store->log_fp) return KVSTORE_ERR_NULL;
 
     char buf[128];
-    int len = snprintf(buf, sizeof(buf), "DEL %d", key);
-    uint32_t crc = ctc32(buf);
+    snprintf(buf, sizeof(buf), "DEL %d", key);
+    uint32_t crc = crc32(buf);
 
-    int bytes = fprintf(store->log_fp, "%s | %u\n", buf, crc);
+    int bytes = fprintf(store->log_fp, "%s|%u\n", buf, crc);
     fflush(store->log_fp);
 
     store->log_size += bytes;
@@ -344,7 +333,17 @@ static int kvstore_log_del(kvstore* store, int key) {
  */
 static int compact_write_cb(int key, long value, void* arg) {
     FILE* fp = (FILE*)arg;  // 强转，把万能指针还原为文件指针
-    fprintf(fp, "PUT %d %ld\n", key, value);
+
+    // 1. 准备缓冲区
+    char payload[128];
+    snprintf(payload, sizeof(payload), "PUT %d %ld", key, value);
+
+    // 2. 调用 crc32()
+    uint32_t crc_val = crc32(payload);
+
+    // 3. 写入完整格式: Payload | CRC\n
+    fprintf(fp, "%s|%u\n", payload, crc_val);
+
     return KVSTORE_OK;
 }
 
@@ -362,13 +361,16 @@ int kvstore_compact(kvstore* store) {
     FILE* fp = fopen("data.compact", "w");
     if (!fp) {
         perror("fopen compact");
-        return -1;
+        return KVSTORE_ERR_IO;
     }
+
+    /* 必须先写 Header！ */
+    fprintf(fp, "%s\n", KVSTORE_LOG_VERSION);
 
     /* 2. 顺序扫描 B+ 树 */
     if (bptree_scan(store->tree, compact_write_cb, fp) != 0) {
         fclose(fp);
-        return -1;
+        return KVSTORE_ERR_INTERNAL;
     }
 
     /* 3. 刷盘，保证落盘 */
@@ -383,7 +385,7 @@ int kvstore_compact(kvstore* store) {
     if (rename(tmp_path, data_path) != 0) {  // 在 Linux / Unix 上：rename 是原子操作
         perror("rename");
         store->log_fp = old_fp;  // 回滚
-        return -1;
+        return KVSTORE_ERR_INTERNAL;
     }
     fclose(old_fp);
 
@@ -392,10 +394,9 @@ int kvstore_compact(kvstore* store) {
     store->log_fp = fopen(data_path, "a+");
     if (!store->log_fp) {
         perror("reopen data.log");
-        return -1;
+        return KVSTORE_ERR_INTERNAL;
     }
 
-    // 创建 snapshot
     kvstore_create_snapshot(store);
     return KVSTORE_OK;
 }
@@ -404,7 +405,7 @@ int kvstore_compact(kvstore* store) {
  * 自动触发器
  */
 static void kvstore_maybe_compact(kvstore* store) {
-    if (!store) return KVSTORE_ERR_NULL;
+    if (!store) return;
 
     // store->log_size - 空间维度，日志文件太大，需要压缩
     // store->ops_count - 时间/效率维度，防止“重放”太慢
@@ -423,7 +424,17 @@ static void kvstore_maybe_compact(kvstore* store) {
  */
 static int snapshot_write_cb(int key, long value, void* arg) {
     FILE* fp = (FILE*)arg;
-    fprintf(fp, "PUT %d %ld", key, value);
+
+    // 1. 构造 Payload
+    char payload[128];
+    snprintf(payload, sizeof(payload), "PUT %d %ld", key, value);
+
+    // 2. 计算 CRC (必须加，否则 replay 不认识)
+    uint32_t crc_val = crc32(payload);
+
+    // 3. 按照 V3 标准格式写入：数据 | 校验码\n
+    fprintf(fp, "%s|%u\n", payload, crc_val);
+
     return KVSTORE_OK;
 }
 
@@ -441,12 +452,12 @@ static int kvstore_create_snapshot(kvstore* store) {
     FILE* fp = fopen(tmp, "w");
     if (!fp) {
         perror("fopen snapshot");
-        return -1;
+        return KVSTORE_ERR_INTERNAL;
     }
 
     if (bptree_scan(store->tree, snapshot_write_cb, fp) != 0) {
         fclose(fp);
-        return -1;
+        return KVSTORE_ERR_INTERNAL;
     }
 
     fflush(fp);
@@ -475,7 +486,7 @@ static int kvstore_load_snapshot(kvstore* store) {
         long value;
 
         if (sscanf(line, "PUT %d %ld", &key, &value) == 2) {
-            kvstore_apply_put(store->tree, key, value);
+            kvstore_apply_put_internal(store->tree, key, value, store->mode);
         }
     }
 
@@ -484,7 +495,7 @@ static int kvstore_load_snapshot(kvstore* store) {
 }
 
 // CRC 函数（简单版）- 循环冗余校验
-static uint32_t crc32(const char* s) {
+uint32_t crc32(const char* s) {
     uint32_t crc = 0xFFFFFFFF;
     while (*s) {
         crc ^= (unsigned char)*s++;
@@ -497,82 +508,122 @@ static uint32_t crc32(const char* s) {
 }
 
 // 先校验 Header + Version
-static int kvstore_log_header(FILE* fp) {
-    char line[64];
-    if (!fgets(line, sizeof(line), fp)) return -1;
-
-    if (strncmp(line, "KVSTORE_LOG_V1", 14) != 0) {
-        fprintf(stderr, "Invalid log version\n");
-        return -1;
+static int kvstore_log_header(const char* line) {
+    if (strncmp(line, KVSTORE_LOG_VERSION, strlen(KVSTORE_LOG_VERSION)) != 0) {
+        fprintf(stderr, "Invalid log version. Expected: %s\n", KVSTORE_LOG_VERSION);
+        return KVSTORE_ERR_CORRUPTED;
     }
 
     return KVSTORE_OK;
 }
-
 
 /**
  * 校验单行日志的完整性
  *  - 成功返回 1， 失败返回 0
  * 注意：此函数会修改 line 字符串（就地切割）
  */
-static int kvstore_crc_check(char* line) {
-    // 1. 去掉末尾换行符
-    line[strcspn(line, "\r\n")] = '\0';  // 去掉换行 \n
+static int kvstore_crc_check(const char* payload, const char* crc_str) {
+    if (!payload || !crc_str) return 0;
 
-    // 2. 寻找分隔符
-    char* sep = strchr(line, '|');
-    if (!sep) return 0;  
+    char* end = NULL;
+    uint32_t crc_stored = (uint32_t)strtoul(crc_str, &end, 10);
 
-    // 3. 切割字符串
-    *sep = '\0';  // 把 '|' 改成了 '\0'（字符串结束符），把这一行一刀切成两断
-        // NOTE: split line in-place: "CMD|CRC" -> "CMD\0CRC"
+    /* crc 字段非法 */
+    if (end == crc_str || *end != '\0')
+        return 0;
 
-    // 4. 读取存储的 CRC
-    uint32_t crc_stored = (uint32_t)strtoul(sep + 1, NULL, 10);
-    
-    // 5. 计算并对比
-    return (crc32(line) == crc_stored);
+    uint32_t crc_calc = crc32(payload);
+    return crc_calc == crc_stored;
 }
 
 /**
+ * 日志重放（replay）
+ *
+ * rewind - 把文件的读取+指针（光标） 重置到文件开头（a+ 模式打开， 默认在文件末尾）
+ * fgets  - 从文件中读取一行，直到换行符 \n 或者读满了255个字符
+ * sscanf - 从字符串里提取数据吗，返回成功汽配并复制的变量个数
+ *          scanf(...): 从键盘输入（标准输入）读取。
+ *          fscanf(fp, ...): 直接从文件读取。
+ *          sscanf(str, ...): 从内存中的字符串读取
+ *
  * 校验每一条日志
  *  - replay 不调用 public API, 所以不会触发 readonly 检查
  *  - apply 是 “特权通道”
  */
 static int kvstore_replay_log(kvstore* store) {
-    if (!store || !store->tree) return KVSTORE_ERR_NULL;
+    if (!store || !store->tree || !store->log_fp) RETURN_ERR(KVSTORE_ERR_NULL);
 
-    store->readonly = 1;  // 进入只读恢复模式 1
+    store->mode = KVSTORE_MODE_REPLAY;
 
     char line[256];
+    int rc = KVSTORE_OK;
+
     rewind(store->log_fp);
 
-    if (kvstore_check_log_header(store->log_fp) != 0) {
-        return KVSTORE_ERR_NULL;
+    // 读取并校验 header
+    if (!fgets(line, sizeof(line), store->log_fp)) {
+        // 空日志，允许
+        goto out;
     }
 
+    if (kvstore_log_header(line) != KVSTORE_OK) {
+        rc = KVSTORE_ERR_CORRUPTED;
+        goto out;
+    }
+
+    // replay body
     while (fgets(line, sizeof(line), store->log_fp)) {
-        
-        // 使用封装好的校验函数
-        if (!kvstore_crc_check(line)) {
-            // 发现损坏，将数据库置为只读以防万一，并报错
-            store->readonly = 1; 
-            return KVSTORE_ERR_CORRUPTED;
+        /* 1. 跳过空行 */
+        if (line[0] == '\n' || line[0] == '\r' || line[0] == ' ')
+            continue;
+
+        /* 2. 去掉末尾换行 */
+        line[strcspn(line, "\r\n")] = '\0';
+
+        /* 3. split payload | crc */
+        char* sep = strchr(line, '|');
+        if (!sep) {
+            // 容忍尾行被破坏
+            // rc = KVSTORE_ERR_CORRUPTED;
+
+            // 不报错，直接当作读完
+            rc = KVSTORE_OK;
+            break;
         }
-        
-        // 校验通过后，直接对 line 进行解析
+
+        *sep = '\0';
+        char* crc_str = sep + 1;
+
+        /* 4. CRC 校验（只校验 payload） */
+        if (!kvstore_crc_check(line, crc_str)) {
+            if (feof(store->log_fp)) {
+                printf("[DEBUG] 容忍末尾不完整的行：%s\n", line);
+                rc = KVSTORE_OK;
+                break;
+            }
+
+            rc = KVSTORE_ERR_CORRUPTED;
+            fprintf(stderr, "[DEBUG] CRC failed! Payload: [%s], Stored CRC: [%s]\n", line, crc_str);
+            break;
+        }
+
+        /* 5. apply */
         int key;
         long val;
+
         if (sscanf(line, "PUT %d %ld", &key, &val) == 2) {
-            kvstore_apply_put(store->tree, key, val);
+            kvstore_apply_put_internal(store->tree, key, val, store->mode);
         } else if (sscanf(line, "DEL %d", &key) == 1) {
-            kvstore_apply_del(store->tree, key);
+            kvstore_apply_del_internal(store->tree, key);
+        } else {
+            rc = KVSTORE_ERR_CORRUPTED;
+            break;
         }
     }
 
-    // replay 完成，恢复正常模式 0
-    store->readonly = 0;
-    return KVSTORE_OK;
+out:
+    store->mode = KVSTORE_MODE_NORMAL;
+    return rc;
 }
 
 /**
@@ -598,5 +649,17 @@ const char* kvstore_strerror(int err) {
             return "data corrupted";
         default:
             return "unknown error";
+    }
+}
+
+// int kvstore_snapshot_exists(const char* path) {
+//     return access(path, F_OK);
+// }
+
+// 调试专用：手动切换数据库模式
+void kvstore_debug_set_mode(kvstore* store, kvstore_mode_t mode) {
+    if (store) {
+        store->mode = mode;
+        fprintf(stderr, "[debug] 手动切换至 %d模式\n", mode);
     }
 }

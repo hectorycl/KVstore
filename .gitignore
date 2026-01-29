@@ -1,3 +1,6 @@
+# 忽略所有数据文件
 *.o
 test_kvstore
 .vscode/
+data.*
+*.exe

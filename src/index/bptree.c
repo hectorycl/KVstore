@@ -256,7 +256,7 @@ int bptree_insert(bptree* tree, int key, long value) {
         if (leaf->keys[i] == key) {
             // --- 关键修改：如果找到了，直接更新 value 并返回 ---
             leaf->values[i] = value;
-            printf("键 %d 已存在，已更新值为 %ld\n", key, value);
+            //printf("键 %d 已存在，已更新值为 %ld\n", key, value);
             return BPTREE_OK;
         }
     }
@@ -1382,7 +1382,7 @@ static bptree_node* bptree_leafmost_leaf(bptree* tree) {
 int bptree_scan(bptree* tree, bptree_leaf_visit_fn visit, void* arg) {
     if (!tree || !visit) return -1;  // BPTREE_ERR = -1
 
-    bptree_node* leaf = bptree_leftmost_leaf(tree);
+    bptree_node* leaf = bptree_leafmost_leaf(tree);
     while (leaf) {
         for (int i = 0; i < leaf->key_count; i++) {
             // 回调调用，每一条数据都会被扔给 visit
