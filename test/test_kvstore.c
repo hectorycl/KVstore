@@ -16,7 +16,7 @@
  * 每个测试开始之前，把上一次留下的WAL删掉，确保这是一个干净的 kvstore
  */
 static void cleanup() {
-    remove(TEST_LOG);   // 或者使用 unlink()
+    remove(TEST_LOG);  // 或者使用 unlink()
     remove(SNAPSHOT_FILE);
 }
 
@@ -273,6 +273,7 @@ void test_crash_recovery() {
 
 // ========  test 9. 空日志 replay ======
 void test_empty_replay() {
+    // 删除 test.log (WAL) 和 data.snapshot(快照)
     cleanup();
 
     // 强制确认文件不存在
