@@ -114,7 +114,7 @@ bptree_node* bptree_create_node(int is_leaf) {
 bptree* bptree_create() {
     bptree* tree = (bptree*)malloc(sizeof(bptree));  // 分配 B+ 树结构体内存
     if (tree == NULL) {
-        fprintf(stderr, "内存分配失败！\n");
+        fprintf(stderr, "bptree 内存分配失败！\n");
         exit(EXIT_FAILURE);
     }
     tree->root = bptree_create_node(1);  // 根节点初始一定是叶子
@@ -256,7 +256,7 @@ int bptree_insert(bptree* tree, int key, long value) {
         if (leaf->keys[i] == key) {
             // --- 关键修改：如果找到了，直接更新 value 并返回 ---
             leaf->values[i] = value;
-            //printf("键 %d 已存在，已更新值为 %ld\n", key, value);
+            // printf("键 %d 已存在，已更新值为 %ld\n", key, value);
             return BPTREE_OK;
         }
     }

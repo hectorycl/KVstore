@@ -1,6 +1,15 @@
-# 忽略所有数据文件
+# 编译产物
 *.o
 test_kvstore
-.vscode/
-data.*
+
 *.exe
+
+# 数据库文件
+data.*
+*.log
+*.db
+test.log*
+
+# 编辑器配置
+.vscode/
+.idea/
