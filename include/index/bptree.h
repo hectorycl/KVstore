@@ -46,16 +46,22 @@ void bptree_print_structure(bptree* tree);
  * “协议”（函数指针）
  * 函数指针可以储存“一个函数的地址”
  * int (*visit)(...);  内存里存的是一段指令的起始地址
- * 
+ *
  * 回调机制（Callback）
  * 本质是：控制权的反转
  * 把compact_visit 函数交给 bptree_scan, bptree_scan 在遍历时，会回过头来调用自己写的那个函数
  *  - 实现了底层(B+ 树) 与业务逻辑（写日志文件）的完全解耦：B+ 树只负责把 key 和 value 从树叶里掏出来，
  *      扔给回调函数，
- * 
+ *
  * 万能桥梁：void* arg - 万能指针
- * 
- * 
+ *
+ * int - 返回值
+ * (*bptree_leaf_visit_fn) - 新类型的名字，凡是属于这种类型的变量，本质上都是一个指针
+ *                           且它专门指向一类函数
+ * (int key, long value, void* arg) - 参数
+ *
+ * 简化：
+ *  - int (*fn)(int, long, void*);  - fn 是一个函数指针
  */
 typedef int (*bptree_leaf_visit_fn)(int key, long value, void* arg);
 int bptree_scan(bptree* tree, bptree_leaf_visit_fn visit, void* arg);
