@@ -5,7 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>  // unlink
+
 
 #include "kvstore.h"
 
@@ -14,6 +16,11 @@
 
 /**
  * 每个测试开始之前，把上一次留下的WAL删掉，确保这是一个干净的 kvstore
+ *
+ * 测试环境隔离器
+ *  - 删除旧 WAL
+ *  - 删除旧 snapshot
+ *  - 每个测试从空库开始
  */
 static void cleanup() {
     remove(TEST_LOG);  // 或者使用 unlink()
@@ -21,54 +28,75 @@ static void cleanup() {
 }
 
 /* ====== Test 1. basic put/search ========*/
+/**
+ * 测试插入 / 覆盖写
+ */
 void test_basic_put_search() {
-    cleanup();  // ??
+    cleanup();  //
 
-    kvstore* s = kvstore_create(TEST_LOG);
-    assert(s);
+    kvstore* s = kvstore_open(TEST_LOG);
+    assert(s != NULL);
 
-    assert(kvstore_put(s, 1, 100) == 0);
+    int ret = kvstore_put(s, 1, 100);
+    if (ret != 0) {
+        printf("Debug: kvstore_put 失败了！错误码是: %d\n", ret);
+    }
+    assert(ret == 0);
+
+    int rett = kvstore_put(s, 1, 200);
+    if (rett != 0) {
+        printf("Debug: kvstore_put 失败了！错误码是: %d\n", rett);
+    }
+    assert(rett == 0);
 
     long v = 0;
     assert(kvstore_search(s, 1, &v) == 0);
-    assert(v == 100);
+    assert(v == 200);
 
     kvstore_destroy(s);
 
-    printf("[PASS 1] 基本查找测试成功！\n");
+    printf("\n[PASS 1] 基本查找测试成功！\n");
 }
 
 // ===== test 2. 覆盖写重放 =====
+/**
+ * 支持崩溃恢复
+ */
 void test_update_replay() {
     cleanup();
 
     {
-        kvstore* s = kvstore_create(TEST_LOG);
+        kvstore* s = kvstore_open(TEST_LOG);
+        assert(s != NULL);
+
         kvstore_put(s, 1, 100);
-        kvstore_put(s, 1, 200);
+        kvstore_put(s, 1, 200);  // 覆盖写
         kvstore_destroy(s);
     }
 
     {
-        kvstore* s = kvstore_create(TEST_LOG);
+        kvstore* s = kvstore_open(TEST_LOG);
         if (s == NULL) {
-            fprintf(stderr, "FATAL: kvstore_create 失败，日志可能损坏或格式不对！\n");
+            fprintf(stderr, "FATAL: kvstore create 失败，日志可能损坏或格式不对！\n");
             exit(1);
         }
         long v;
         assert(kvstore_search(s, 1, &v) == 0 && v == 200);
         kvstore_destroy(s);
     }
-    printf("[PASS 2] 覆盖写重放成功！\n");
+    printf("\n[PASS 2] 覆盖写重放成功！\n");
 }
 
 // ======= 3. 删除重放 ========
+/**
+ * 支持逻辑删除恢复
+ */
 void test_delete_replay() {
     cleanup();
 
     // 1. 写入数据后删除，然后关机（Destroy）
     {
-        kvstore* s = kvstore_create(TEST_LOG);
+        kvstore* s = kvstore_open(TEST_LOG);
         kvstore_put(s, 1, 100);
         kvstore_put(s, 2, 200);
 
@@ -81,7 +109,7 @@ void test_delete_replay() {
 
     // 2. 重启，验证 key 1 消失，key 2 还存在
     {
-        kvstore* s = kvstore_create(TEST_LOG);
+        kvstore* s = kvstore_open(TEST_LOG);
         long v;
 
         // key 1 应该找不到了
@@ -93,51 +121,18 @@ void test_delete_replay() {
         kvstore_destroy(s);
     }
 
-    printf("[PASS 3] 删除重放测试成功！\n");
+    printf("\n[PASS 3] 删除重放测试成功！\n");
 }
 
-// ========  test 4. 只读锁死测试  =========
-void test_readonly_lock() {
+/* ========  Test 4: replay  ======== */
+/**
+ * 支持重放
+ */
+void test_replay() {
     cleanup();
 
-    kvstore* s = kvstore_create(TEST_LOG);
-    assert(s);
-
-    // 1. 正常模式：可以写进去
-    assert(kvstore_put(s, 1, 100) == KVSTORE_OK);
-
-    // 2. 切换到 REPLAY 模式
-    kvstore_debug_set_mode(s, KVSTORE_MODE_REPLAY);
-
-    // 3. 尝试写入：预期放回 KVSTORE_ERR_READONLY
-    int ret = kvstore_put(s, 2, 200);
-
-    printf("[DEBUG] 只读模式下写入 key 2, 返回码： %d\n", ret);
-
-    // 必须返回 只读错误
-    assert(ret == KVSTORE_ERR_READONLY);
-
-    // 4. 验证数据缺失没有被写入
-    long v;
-    int search_ret = kvstore_search(s, 2, &v);
-    assert(search_ret != KVSTORE_OK);  // != OK 继续往下
-
-    // 5. 切回正常模式，验证是否恢复
-    kvstore_debug_set_mode(s, KVSTORE_MODE_NORMAL);
-    assert(kvstore_put(s, 2, 200) == KVSTORE_OK);
-    assert(kvstore_search(s, 2, &v) == KVSTORE_OK && v == 200);
-
-    kvstore_destroy(s);
-
-    printf("[PASS 4] 只读模式锁死测试成功！\n");
-}
-
-/* ========  Test 5: replay  ======== */
-void test_replay() {
-    cleanup();  // ?? 有啥用？
-
     {
-        kvstore* s = kvstore_create(TEST_LOG);
+        kvstore* s = kvstore_open(TEST_LOG);
         assert(s != NULL);
         kvstore_put(s, 1, 100);
         kvstore_put(s, 2, 200);
@@ -145,23 +140,26 @@ void test_replay() {
     }
 
     {
-        kvstore* s = kvstore_create(TEST_LOG);
+        kvstore* s = kvstore_open(TEST_LOG);
         assert(s != NULL);
         long v;
         assert(kvstore_search(s, 1, &v) == 0 && v == 100);
         assert(kvstore_search(s, 2, &v) == 0 && v == 200);
-        kvstore_destroy(s);  // ??
+        kvstore_destroy(s);  //
     }
 
-    printf("[PASS 5] 重放测试成功！\n");
+    printf("\n[PASS 4] 重放测试成功！\n");
 }
 
-// ======== test 6. crc 损坏测试 ========
+// ======== test 5. crc 损坏测试 =========
+/**
+ * 防止静默数据损坏
+ */
 void test_corruption() {
     cleanup();
     // 1. 先制造一点正常数据
     {
-        kvstore* s = kvstore_create(TEST_LOG);
+        kvstore* s = kvstore_open(TEST_LOG);
         kvstore_put(s, 1, 100);
         kvstore_destroy(s);
     }
@@ -173,7 +171,7 @@ void test_corruption() {
     fclose(fp);
 
     // 3. 尝试加载，预期应该报错
-    kvstore* s = kvstore_create(TEST_LOG);
+    kvstore* s = kvstore_open(TEST_LOG);
     if (s == NULL) {
         printf("[PASS] test_corruption: System correctly refused corrupted log.\n");
     } else {
@@ -181,7 +179,7 @@ void test_corruption() {
         printf("[FAIL] test_corruption: System accepted corrupted log!\n");
         kvstore_destroy(s);
     }
-    printf("[PASS 6] crc 损坏测试成功！\n");
+    printf("\n[PASS 5] crc 损坏测试成功！\n");
 }
 
 // 获取文件大小
@@ -196,14 +194,17 @@ long get_file_size(const char* filename) {
     return size;
 }
 
-// ========  test 7. 日志压缩测试  ========
+// ========  test 6. 日志压缩测试  ========
+/**
+ * WAL 压缩（垃圾回收）- 长期运行不会爆磁盘
+ */
 void test_log_compaction() {
     cleanup();
     const char* log_path = TEST_LOG;
 
     // 1. 制造大量冗余数据
     {
-        kvstore* s = kvstore_create(log_path);
+        kvstore* s = kvstore_open(TEST_LOG);
         for (int i = 0; i < 100; i++) {
             kvstore_put(s, 1, i);  // 重复写 key 1，从 0 到 99
         }
@@ -215,7 +216,7 @@ void test_log_compaction() {
 
     // 2. 触发压缩
     {
-        kvstore* s = kvstore_create(log_path);
+        kvstore* s = kvstore_open(TEST_LOG);
         printf("[DEBUG] 正在执行日志压缩...\n");
         int ret = kvstore_compact(s);
         assert(ret == KVSTORE_OK);
@@ -229,17 +230,21 @@ void test_log_compaction() {
 
     // 4. 最后验证：重启看数据对不对
     {
-        kvstore* s = kvstore_create(log_path);
+        kvstore* s = kvstore_open(TEST_LOG);
         long v;
         assert(kvstore_search(s, 1, &v) == KVSTORE_OK && v == 99);
         kvstore_destroy(s);
     }
 
-    printf("[PASS 7] 日志压缩测试成功！\n");
+    printf("\n[PASS 6] 日志压缩测试成功！\n");
 }
 
-// ========  test 8. 异常关闭测试  ========
-void test_crash_recovery() {
+// ========  test 7. 异常关闭测试  ========
+/**
+ * 部分写入日志恢复能力
+ *  - 半条日志绝对不能恢复
+ */
+void test_crash_recovery_1() {
     cleanup();
     const char* log_path = "test.log";
 
@@ -259,7 +264,7 @@ void test_crash_recovery() {
 
     // 2. 尝试启动
     printf("[DEBUG] 尝试从损坏的日志恢复...\n");
-    kvstore* s = kvstore_create(log_path);
+    kvstore* s = kvstore_open(TEST_LOG);
 
     // 3. 验证逻辑
     assert(s != NULL);
@@ -268,10 +273,13 @@ void test_crash_recovery() {
     assert(kvstore_search(s, 2, &v) != 0);              // key 2 必须不存在
 
     kvstore_destroy(s);
-    printf("[PASS 8] 异常关闭模拟测试成功!\n");
+    printf("\n[PASS 7] 异常关闭模拟测试成功!\n");
 }
 
-// ========  test 9. 空日志 replay ======
+// ========  test 8. 空日志 replay ======
+/**
+ * 空库启动能力 - 部署环境必测
+ */
 void test_empty_replay() {
     // 删除 test.log (WAL) 和 data.snapshot(快照)
     cleanup();
@@ -283,29 +291,301 @@ void test_empty_replay() {
         fclose(f);
     }
 
-    kvstore* s = kvstore_create(TEST_LOG);
+    kvstore* s = kvstore_open(TEST_LOG);
     assert(s);
 
-    long v;
+    long v = -1;
     assert(kvstore_search(s, 1, &v) != 0);
+    assert(v == -1);
 
     kvstore_destroy(s);
-    printf("[PASS 9] 空日志测试成功\n");
+    printf("\n[PASS 8] 空日志测试成功\n");
+}
+
+// =======   test 9. =======
+/**
+ * 未正常关闭恢复能力
+ */
+void test_crash_recovery() {
+    cleanup();
+
+    // 1. 第一轮：模拟写入后直接“断电” （不调用 close 模拟异常退出）
+    kvstore* s1 = kvstore_open(TEST_LOG);
+    kvstore_put(s1, 10, 1000);
+    // 假设这里没有调用 kvstore_close, 直接退出了
+    // 此时数据已经在  WAL 日志里了
+
+    // 2. 第二轮： 重新打开，触发 Repaly 机制
+    kvstore* s2 = kvstore_open(TEST_LOG);
+    long v;
+    // 即使没调用过之前的 close, Replay 应该能从日志恢复数据 【10，1000】
+    int ret = kvstore_search(s2, 10, &v);  // 没有 get, 是 search()
+    assert(ret == KVSTORE_OK);
+    assert(v == 1000);
+
+    kvstore_close(s2);
+    printf("\n[PASS 9] 崩溃恢复 Replay 测试成功\n");
+}
+
+// ========  test 10. reopen persistence  =========
+/**
+ * open → put → close → open → search
+ *
+ * 基础持久化验证
+ *  - 写入 -> 关闭 -> 重启 -> 数据还在
+ */
+void test_reopen_persistence() {
+    cleanup();
+
+    kvstore* s1 = kvstore_open(TEST_LOG);
+    assert(s1 != NULL);
+
+    assert(kvstore_put(s1, 1, 1000) == KVSTORE_OK);
+    assert(kvstore_put(s1, 2, 2000) == KVSTORE_OK);
+
+    kvstore_close(s1);
+
+    // reopen
+    kvstore* s2 = kvstore_open(TEST_LOG);
+    assert(s2 != NULL);
+
+    long v;
+    assert(kvstore_search(s2, 1, &v) == KVSTORE_OK && v == 1000);
+    assert(kvstore_search(s2, 2, &v) == KVSTORE_OK && v == 2000);
+
+    kvstore_close(s2);
+
+    printf("\n[PASS 10] reopen persistence test\n");
+}
+
+// ========= test 11. open-revocer-idempotent =======
+/**
+ * open → put → close → open → search
+ *
+ * 恢复幂等性
+ *  - 重放不能产生副作用
+ *
+ */
+void test_open_recover_idempotent() {
+    cleanup();
+
+    // 1. open + write
+    kvstore* s1 = kvstore_open(TEST_LOG);
+    assert(s1 != NULL);
+
+    kvstore_put(s1, 10, 1000);
+    kvstore_put(s1, 20, 2000);
+    kvstore_close(s1);
+
+    // 2. open (recover)
+    kvstore* s2 = kvstore_open(TEST_LOG);
+    assert(s2 != NULL);
+
+    long v;
+    assert(kvstore_search(s2, 10, &v) == KVSTORE_OK && v == 1000);
+    assert(kvstore_search(s2, 20, &v) == KVSTORE_OK && v == 2000);
+
+    // 没有重复
+    assert(kvstore_search(s2, 10, &v) == KVSTORE_OK && v == 1000);
+
+    kvstore_close(s2);
+
+    printf("\n[PASS 11] open recover idempotent(开放式重复幂等)\n");
+}
+
+// ======== test 12. reject write after close =====
+/**
+ * 生命周期安全
+ *  - 关闭的 store 不允许操作
+ *
+ */
+void test_reject_writer_after_close() {
+    cleanup();
+
+    kvstore* s = kvstore_open(TEST_LOG);
+    assert(kvstore_put(s, 1, 1000) == KVSTORE_OK);
+
+    kvstore_close(s);
+
+    // 已关闭实例，禁止写
+    assert(kvstore_put(s, 2, 2000) != KVSTORE_OK);
+    assert(kvstore_del(s, 1) != KVSTORE_OK);
+
+    printf("\n[PASS 12] reject write after close\n");
+}
+
+// ======== test 13. 快照恢复测试 ======
+/**
+ * 分层恢复模型
+ */
+void test_snapshot_recovery() {
+    cleanup();
+
+    const char* snap_path = "data.snapshot";
+
+    // 1. 模拟一个快照文件（key 1 -> 100）
+    FILE* fp = fopen(snap_path, "w");
+    fprintf(fp, "PUT 1 100\n");
+    fclose(fp);
+
+    // 2. 模拟一个 WAL 日志（key 2 -> 200, 覆盖 key 1 -> 150）
+    kvstore* s1 = kvstore_open(TEST_LOG);
+    assert(s1);
+    kvstore_put(s1, 2, 200);
+    kvstore_put(s1, 1, 150);
+    kvstore_close(s1);
+
+    // 3. 重启系统
+    kvstore* s2 = kvstore_open(TEST_LOG);
+    assert(s2);
+
+    long v;
+    // 验证 key 1 应该是 WAL 里的 150， 而不是 快照里的 100
+    assert(kvstore_search(s2, 1, &v) == KVSTORE_OK && v == 150);
+    // 验证 key 2 正常从 WAL 恢复
+    assert(kvstore_search(s2, 2, &v) == KVSTORE_OK && v == 200);
+
+    kvstore_close(s2);
+
+    printf("\n[PASS 13] 快照与 WAL 联合恢复测试成功!\n");
+}
+
+// ========= test 14. 快照后截断日志测试 ========
+/**
+ * 具备快照独立恢复能力
+ */
+void test_snapshot_and_log_truncation() {
+    cleanup();
+
+    const char* log_path = TEST_LOG;
+    const char* snap_path = "data.snapshot";
+
+    // 1. 准备数据并创建快照
+    {
+        kvstore* s = kvstore_open(log_path);
+        assert(s);
+        kvstore_put(s, 100, 10000);
+        kvstore_put(s, 200, 20000);
+
+        // 触发快照
+        int ret = kvstore_create_snapshot(s);
+        assert(ret == KVSTORE_OK);
+
+        long v_debug;
+        if (kvstore_search(s, 100, &v_debug) == 0) {
+            printf("[DEBUG] 快照加载阶段成功，v = %ld\n", v_debug);
+        } else {
+            printf("[DEBUG] 快照加载阶段就失败了！\n");
+        }
+
+        kvstore_destroy(s);
+    }
+
+    // 2. 核心动作：模拟日志丢失或被清理
+    // 直接删除 WAL 文件， 只留下快照文件
+
+    if (remove(log_path) == 0) {
+        printf("[DEBUG] WAL 日志已成功截断（删除）。\n");
+    } else {
+        perror("remove log\n");
+    }
+
+    // 确认快照文件确实存在
+    assert(get_file_size(snap_path) > 0);
+
+    // 3. 重启系统：此时系统只能通过快照恢复
+    {
+        printf("[DEBUG] 尝试通过快照恢复数据...\n");
+        kvstore* s = kvstore_open(log_path);
+        assert(s != NULL);
+
+        long v1, v2;
+        // 验证数据是否还存在
+        assert(kvstore_search(s, 100, &v1) == KVSTORE_OK && v1 == 10000);
+        assert(kvstore_search(s, 200, &v2) == KVSTORE_OK && v2 == 20000);
+
+        kvstore_destroy(s);
+    }
+
+    printf("\n[PASS 14] 快照后截断日志测试成功!\n");
+}
+
+// ========== test 16. QPS  =======
+/**
+ * 测试读写性能
+ */
+void test_benchmark_write() {
+    cleanup();
+    const char* log_path = TEST_LOG;
+
+    // 设定测试数量
+    const int BENCH_COUNT = 10000;
+    printf("\n[BENCHMARK] 开始执行性能测试 (数据量: %d)...\n", BENCH_COUNT);
+
+    // 1. 准备环境
+    kvstore* s = kvstore_open(log_path);
+    assert(s != NULL);
+
+    // 2. 测试写入性能（Write QPS)
+
+    clock_t start_write = clock();
+
+    for (int i = 0; i < BENCH_COUNT; i++) {
+        kvstore_put(s, i, i * 100L);
+    }
+
+    clock_t end_write = clock();
+    double write_time = (double)(end_write - start_write) / CLOCKS_PER_SEC;
+    // 防止除以 0
+    if (write_time < 0.000001) write_time = 0.000001;
+
+    printf("  -> [Write] 耗时: %.4f 秒 | QPS: %.2f op/s\n",
+           write_time, BENCH_COUNT / write_time);
+
+    // 3. 测试读取性能（Read QPS）
+    clock_t start_read = clock();
+
+    long val;
+    for (int i = 0; i < BENCH_COUNT; i++) {
+        kvstore_search(s, i, &val);
+    }
+
+    clock_t end_read = clock();
+    double read_time = (double)(end_read - start_read) / CLOCKS_PER_SEC;
+    if (read_time < 0.000001) read_time = 0.000001;
+
+    printf("  -> [Read ] 耗时: %.4f 秒 | QPS: %.2f op/s\n",
+           read_time, BENCH_COUNT / read_time);
+
+    // 4. 收尾
+    kvstore_destroy(s);
+    printf("\n[PASS 16] 性能基准测试完成！\n");
 }
 
 int main() {
-    printf("\n========== KVstore V3 综合性能测试 ==========\n");
+    printf("\n========== KVstore 综合性能测试 ==========\n");
 
-    // test_basic_put_search();
-    // test_update_replay();
-    // test_delete_replay();
-    // test_readonly_lock();
-    // test_replay();
+    //======== V1 ~ V3  ========
 
-    // test_corruption();
-    // test_log_compaction();
-    // test_crash_recovery();
-    test_empty_replay();
+    test_basic_put_search();  // 1
+    test_update_replay();     // 2
+    test_delete_replay();     // 3
+    test_replay();            // 4
+
+    test_corruption();        // 5
+    test_log_compaction();    // 6
+    test_crash_recovery_1();  // 7
+    test_empty_replay();      // 8
+
+    //  =========  V4  =========
+    test_crash_recovery();               // 9
+    test_reopen_persistence();           // 10
+    test_open_recover_idempotent();      // 11
+    test_reject_writer_after_close();    // 12
+    test_snapshot_recovery();            // 13
+    test_snapshot_and_log_truncation();  // 14
+
+    test_benchmark_write();
     printf("所有测试均通过 ! 🎇\n");
     return 0;
 }

@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 #define BPTREE_OK  0
+#define BPTREE_UPDATED 1
 #define BPTREE_ERR -1
 
 typedef struct _bptree bptree;

@@ -2,7 +2,7 @@
 CC = gcc
 CXX = g++
 # 包含所有必要的头文件路径
-CFLAGS = -Wall -g -I./include -I./include/index
+CFLAGS = -Wall -g -I./include -I./include/index 
 CXXFLAGS = -Wall -g -I./include -I./include/index
 
 # 2. 目录定义

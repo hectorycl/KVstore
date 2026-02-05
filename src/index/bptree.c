@@ -257,7 +257,7 @@ int bptree_insert(bptree* tree, int key, long value) {
             // --- 关键修改：如果找到了，直接更新 value 并返回 ---
             leaf->values[i] = value;
             // printf("键 %d 已存在，已更新值为 %ld\n", key, value);
-            return BPTREE_OK;
+            return BPTREE_UPDATED;
         }
     }
 
