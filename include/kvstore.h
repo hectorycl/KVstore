@@ -139,7 +139,6 @@ int kvstore_del(kvstore* store, int key);
 int kvstore_create_snapshot(kvstore* store);
 
 /* ========== 高级接口 ========== */
-int kvstore_insert(kvstore* store, int key, long value);
 int kvstore_search(kvstore* store, int key, long* value);
 int kvstore_compact(kvstore* store);
 
