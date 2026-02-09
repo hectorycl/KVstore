@@ -13,8 +13,6 @@
 
 #include "index/bptree.h"
 
-
-
 #define KVSTORE_MAX_OPS 1000
 #define KVSTORE_MAX_LOG_SIZE 4 * 1024 * 1024  // 4MB
 
@@ -24,23 +22,23 @@
 // =============================
 // 通用错误（-1 ~ -9）
 // =============================
-#define KVSTORE_ERR_NULL        -1      // 空指针 / 非法参数
-#define KVSTORE_ERR_INTERNAL    -2      // 内部逻辑错误（不应发生）
-#define KVSTORE_ERR_IO          -3      // 文件 / IO 错误
+#define KVSTORE_ERR_NULL -1      // 空指针 / 非法参数
+#define KVSTORE_ERR_INTERNAL -2  // 内部逻辑错误（不应发生）
+#define KVSTORE_ERR_IO -3        // 文件 / IO 错误
 
 // =============================
 // 状态错误（-10 ~ -19）
 // =============================
-#define KVSTORE_ERR_READONLY        -10  // 只读模式，禁止写
-#define KVSTORE_ERR_RECOVERY        -11  // 恢复中（预留）
-#define KVSTORE_ERR_INTERNAL_STATE  -12  // 状态机非法
+#define KVSTORE_ERR_READONLY -10        // 只读模式，禁止写
+#define KVSTORE_ERR_RECOVERY -11        // 恢复中（预留）
+#define KVSTORE_ERR_INTERNAL_STATE -12  // 状态机非法
 
 // =============================
 // 数据错误（-20 ~ -29）
 // =============================
-#define KVSTORE_ERR_NOT_FOUND           -20  // key 不存在
-#define KVSTORE_ERR_WAL_CORRUPTED       -21  
-#define KVSTORE_ERR_SNAPSHOT_CORRUPTED  -22
+#define KVSTORE_ERR_NOT_FOUND -20  // key 不存在
+#define KVSTORE_ERR_WAL_CORRUPTED -21
+#define KVSTORE_ERR_SNAPSHOT_CORRUPTED -22
 
 // =============================
 // 资源错误（-30 ~ -39）
@@ -145,8 +143,6 @@ int kvstore_compact(kvstore* store);
 /* ========== 错误处理 ========== */
 const char* kvstore_strerror(int err);
 
-/* ========== debug 调试 ==========*/
-void kvstore_debug_set_mode(kvstore* store, kvstore_mode_t mode);
 
 // ==========  通用工具 =========
 uint32_t crc32(const char* s);
