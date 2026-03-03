@@ -143,9 +143,9 @@ int kvstore_compact(kvstore* store);
 /* ========== 错误处理 ========== */
 const char* kvstore_strerror(int err);
 
-
 // ==========  通用工具 =========
 uint32_t crc32(const char* s);
+kvstore_state_t kvstore_get_state(kvstore* store);
 
 #ifdef __cplusplus
 }

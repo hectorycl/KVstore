@@ -20,8 +20,12 @@ extern "C" {
 #define BPTREE_OK  0
 #define BPTREE_UPDATED 1
 #define BPTREE_ERR -1
+#define BPTREE_NOT_FOUND -2
 
+
+// 前向声明
 typedef struct _bptree bptree;
+typedef struct _bptree_node bptree_node;
 
 // ============= 创建 / 销毁 ===============
 bptree* bptree_create();

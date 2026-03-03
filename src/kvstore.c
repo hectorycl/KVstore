@@ -1,6 +1,7 @@
 #include "kvstore.h"
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +39,9 @@ struct _kvstore {
 
     size_t log_size;
     size_t ops_count;
+
+    /* ====  V5  ==== */
+    // pthread_rwlock_t root_latch;
 };
 
 typedef struct {
@@ -110,8 +114,6 @@ static int kvstore_compact_internal(kvstore* store);
 static int compact_write_cb(int key, long value, void* arg);
 static int snapshot_write_cb(int key, long value, void* arg);
 
-static int kvstore_create_snapshot(kvstore* store);
-
 /**
  * =========================================================
  * State Machine
@@ -140,6 +142,8 @@ const char* kvstore_strerror(int err);
  * ========================================================= */
 static int kvstore_crc_check(const char* payload, const char* crc_str);
 
+
+
 // ==============  实现  ==================
 
 /**
@@ -159,26 +163,28 @@ kvstore* kvstore_create() {
     if (!store) return NULL;
 
     // 2. 核心索引初始化（apply 层的物质基础）
+    // 锁的初始化细节被“封装”在 bptree_create 内部了
     store->tree = bptree_create();
     if (!store->tree) {
         free(store);  // 异常处理：防止内存泄漏，索引创建失败必须释放外层容器
         return NULL;
     }
 
-    // 3. 状态机初始化
+    // 3. 状态机与元数据初始化
     store->state = KVSTORE_STATE_INIT;
-
-    // 4. 持久化元数据清理（Logging / Maintenance 层）
     store->log_fp = NULL;
     store->log_size = 0;
     store->ops_count = 0;
-
-    // 5. 运行模式设置（Error/Debug 层）
     store->mode = KVSTORE_MODE_NORMAL;
     store->readonly = 0;  // 默认可写
 
+    // 初始化读写锁  ->  废弃大锁  
+    // 职责下放 -> 遵循谁申请，谁初始化，谁负责
+    // pthread_rwlock_init(&store->root_latch, NULL);
+
     return store;
 }
+
 
 /**
  * kvstore_destroy - 销毁并彻底回收 kvstore 实例的所有资源
@@ -413,7 +419,7 @@ int kvstore_close(kvstore* store) {
 
 /**
  * =========================================================
- * Public API — 基本操作
+ * 2️⃣Public API — 基本操作
  * ========================================================= */
 
 /**
@@ -432,11 +438,10 @@ int kvstore_close(kvstore* store) {
  */
 int kvstore_put(kvstore* store, int key, long value) {
     // 1. 基础安全校验
-    if (!store || !key || !value)
-        return KVSTORE_ERR_NULL;
+    if (!store || !store->tree) return KVSTORE_ERR_NULL;
 
-    // 2. 进入原子执行路径
-    return kvstore_exec_write(store, KVSTORE_OP_PUT, key, value);
+    // 2. 原子执行
+    return  kvstore_exec_write(store, KVSTORE_OP_PUT, key, value);
 }
 
 /**
@@ -456,12 +461,12 @@ int kvstore_put(kvstore* store, int key, long value) {
  */
 int kvstore_del(kvstore* store, int key) {
     // 1. 参数合法性校验
-    if (!store || !key)
-        return KVSTORE_ERR_NULL;
+    if (!store || !store->tree) return KVSTORE_ERR_NULL;
 
-    // 2. 逻辑删除的封装
+    // 2. 执行写入逻辑（DEL 也是一种写操作）
     return kvstore_exec_write(store, KVSTORE_OP_DEL, key, 0);
 }
+
 
 /**
  * kvstore_create_snapshot - 创建内存状态的快照
@@ -471,7 +476,7 @@ int kvstore_del(kvstore* store, int key) {
  *  - 使用 B+ Tree scan + callback 解耦策略 （还要重点学习）
  *  - 显示 flush + fsync 保证落盘
  */
-static int kvstore_create_snapshot(kvstore* store) {
+int kvstore_create_snapshot(kvstore* store) {
     if (!store) return KVSTORE_ERR_NULL;
 
     // 先写 tmp, 成功后再原子替换
@@ -530,8 +535,52 @@ int kvstore_search(kvstore* store, int key, long* value) {  // kvstore_get
         return KVSTORE_ERR_INTERNAL_STATE;
     }
 
-    // 3. 委派查询（将任务交给数据结构层[Apply 层]）
+    // 3. 直接调用任务，不再需要全局 root_latch
     return bptree_search(store->tree, key, value);
+}
+
+/**
+ * kvstore_compact - 统筹日志压缩流程，负责运行态的平滑切换
+ *
+ * @details
+ *  - 通过 enter/exit 函数实现逻辑锁，确保快照期间把内存索引不被修改
+ *
+ * 设计模式：包裹模式 （保存-修改-还原）
+ *  1. 现场保护：在执行前通过 prev 变量备份当前的系统状态
+ *  2. 状态锁定：调用 enter_compaction 切换为只读，防止压缩期间数据被篡改
+ *  3. 核心执行：将压缩工作委派给内部函数 compact_internal 处理
+ *  4. 现场恢复：无论压缩成功与否，最终都通过 exit_compaction 恢复之前的系统状态
+ *
+ *  不会导致数据库永久锁死在只读模式，系统几倍自我恢复能力
+ *
+ * [分层好处]
+ *  - kvstore_compact 关注的是流程控制；kvstore_compact_internal 关注的是文件 IO
+ *
+ * 体现了面向切面编程（AOP）的思想
+ */
+int kvstore_compact(kvstore* store) {
+    int ret;
+    kvstore_state_t prev;
+
+    // 1. 安全性检查
+    if (!store) return KVSTORE_ERR_NULL;
+
+    // 2. 状态保存
+    prev = store->state;
+
+    // 3. 前置处理：锁定状态（此时禁止写入）
+    ret = kvstore_enter_compaction(store);
+    if (ret != KVSTORE_OK)
+        return ret;
+
+    // 4. 核心执行 - 执行具体的快照生成和 WAL 阶段逻辑
+    ret = kvstore_compact_internal(store);
+
+    // 5. 后置处理：解锁恢复
+    // 无论压缩成功与否，都必须调用此函数将状态还原（prev）
+    kvstore_exit_compaction(store, prev);
+
+    return ret;
 }
 
 /**
@@ -717,17 +766,17 @@ static int kvstore_replay_log(kvstore* store) {
         }
     }
     // 在退出前打印统计信息
-    int total = stats.applied + stats.skipped + stats.corrupted;
+    // int total = stats.applied + stats.skipped + stats.corrupted;
 
     // 6. 统计收尾
 out:
 
-    printf(
-        "[RECOVERY] applied=%d skipped=%d corrupted=%d success_rate=%.2f%%\n",
-        stats.applied,
-        stats.skipped,
-        stats.corrupted,
-        total ? (100.0 * stats.applied / total) : 100.0);
+    // printf(
+    //     "[RECOVERY] applied=%d skipped=%d corrupted=%d success_rate=%.2f%%\n",
+    //     stats.applied,
+    //     stats.skipped,
+    //     stats.corrupted,
+    //     total ? (100.0 * stats.applied / total) : 100.0);
 
     if (rc != KVSTORE_OK) {
         return kvstore_fatal(store, rc);
@@ -916,6 +965,8 @@ static int kvstore_log_del(kvstore* store, int key) {
     kvstore_replay_* ──→ apply only
  */
 static int kvstore_exec_write(kvstore* store, kvstore_op_t op, int key, int value) {
+    //printf("enter write\n");
+    
     int ret;
 
     /* 1. 基础合法性检查  */
@@ -1183,50 +1234,6 @@ static void kvstore_maybe_compact(kvstore* store) {
             fprintf(stderr, "[WARN] kvstore compaction failed, will retry later\n");
         }
     }
-}
-
-/**
- * kvstore_compact - 统筹日志压缩流程，负责运行态的平滑切换
- *
- * @details
- *  - 通过 enter/exit 函数实现逻辑锁，确保快照期间把内存索引不被修改
- *
- * 设计模式：包裹模式 （保存-修改-还原）
- *  1. 现场保护：在执行前通过 prev 变量备份当前的系统状态
- *  2. 状态锁定：调用 enter_compaction 切换为只读，防止压缩期间数据被篡改
- *  3. 核心执行：将压缩工作委派给内部函数 compact_internal 处理
- *  4. 现场恢复：无论压缩成功与否，最终都通过 exit_compaction 恢复之前的系统状态
- *
- *  不会导致数据库永久锁死在只读模式，系统几倍自我恢复能力
- *
- * [分层好处]
- *  - kvstore_compact 关注的是流程控制；kvstore_compact_internal 关注的是文件 IO
- *
- * 体现了面向切面编程（AOP）的思想
- */
-int kvstore_compact(kvstore* store) {
-    int ret;
-    kvstore_state_t prev;
-
-    // 1. 安全性检查
-    if (!store) return KVSTORE_ERR_NULL;
-
-    // 2. 状态保存
-    prev = store->state;
-
-    // 3. 前置处理：锁定状态（此时禁止写入）
-    ret = kvstore_enter_compaction(store);
-    if (ret != KVSTORE_OK)
-        return ret;
-
-    // 4. 核心执行 - 执行具体的快照生成和 WAL 阶段逻辑
-    ret = kvstore_compact_internal(store);
-
-    // 5. 后置处理：解锁恢复
-    // 无论压缩成功与否，都必须调用此函数将状态还原（prev）
-    kvstore_exit_compaction(store, prev);
-
-    return ret;
 }
 
 /**
@@ -1542,4 +1549,9 @@ static int kvstore_fatal(kvstore* store, int err) {
 
     // 3. 错误透传 - 将引起致命故障的原始错误码原样返回
     return err;
+}
+
+
+kvstore_state_t kvstore_get_state(kvstore* store) {
+    return store->state;
 }
