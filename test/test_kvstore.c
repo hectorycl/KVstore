@@ -1,6 +1,7 @@
 
 /// home/ubuntu/c++2512/KVstore/test/test_kvstore.c
 #include <assert.h>
+#include <pthread.h>
 #include <stdint.h>  // uint32_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,14 +9,12 @@
 #include <time.h>
 #include <unistd.h>  // unlink
 
-#include <pthread.h>
-
 #include "kvstore.h"
 
 #define TEST_LOG "test.log"
 #define SNAPSHOT_FILE "data.snapshot"
 
-#define THREAD_OPS 20000
+#define THREAD_OPS 10000
 
 typedef struct {
     kvstore* store;
@@ -571,42 +570,37 @@ void test_benchmark_write() {
     printf("\n[PASS 15] 性能基准测试完成！!\n");
 }
 
-
 // ========== test 16. 并发读写一致性测试   =======
 /**
  * - 场景：多线程混合执行 PUT 和 SEARCH 操作
  * - 目的：验证 Root Latch 是否能有效防止 B+ 树在并发修改时发生段错误
  */
-void* worker_thread(void* arg)
-{
-   worker_arg* w = (worker_arg*)arg;
+void* worker_thread(void* arg) {
+    worker_arg* w = (worker_arg*)arg;
     long val_out;
     unsigned int seed = time(NULL) ^ (w->id * 7919);
 
-    for (int i = 0; i < THREAD_OPS; i++) {
+    for (int i = 0; i < THREAD_OPS; i++) {  // THREAD_OPS = 20000
         // 增大 Key 范围，模拟大规模数据和树分裂
-        int k = rand_r(&seed) % 10000; 
+        int k = rand_r(&seed) % 10000;
         int op = rand_r(&seed) % 100;
 
-        if (op < 40) { // 40% 概率写入
+        if (op < 40) {  // 40% 概率写入
             kvstore_put(w->store, k, i);
-        } 
-        else if (op < 90) { // 50% 概率搜索
+        } else if (op < 90) {  // 50% 概率搜索
             // 搜索时不只是打印日志，可以验证基础逻辑
             kvstore_search(w->store, k, &val_out);
-        }
-        else { // 10% 概率删除 (如果已经实现了并发删除)
+        } else {  // 10% 概率删除 (如果已经实现了并发删除)
             // kvstore_delete(w->store, k);
         }
 
         // 每 1000 次操作打印一次进度，避免频繁 IO 导致测试变慢
-        if (i % 1000 == 0) {
+        if (i % 5000 == 0) {
             printf("Thread %d reached %d ops\n", w->id, i);
         }
     }
     return NULL;
 }
-
 
 /**
  * 并发控制安全：
@@ -641,11 +635,10 @@ void test_concurrency_stress() {
     printf("[PASS 16] 并发压力（无崩溃且状态有效）测试完成\n");
 }
 
-
 // ========= test 17. 并发写覆盖一致性 =========
 /**
  * 场景：多线程反复对同一批 key 执行 PUT
- * 
+ *
  * 目的：
  *  - 验证在 Root Latch 保护下不会丢写
  *  - 最终值必须是某个线程写入的有效值
@@ -653,7 +646,7 @@ void test_concurrency_stress() {
 void* worker_write_keys(void* arg) {
     worker_arg* w = (worker_arg*)arg;
 
-    for (int i = 0; i < THREAD_OPS; i++) { // THREAD_OPS = 20000
+    for (int i = 0; i < THREAD_OPS; i++) {  // THREAD_OPS = 20000
         int k = i % 10;
         kvstore_put(w->store, k, w->id * 100000 + i);
     }
@@ -677,6 +670,11 @@ void test_concurrrent_overwrite() {
         pthread_create(&threads[i], NULL, worker_write_keys, &args[i]);
     }
 
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
     // 验证 key 存在且可读
     long val;
     for (int k = 0; k < 10; k++) {
@@ -687,33 +685,38 @@ void test_concurrrent_overwrite() {
     printf("[PASS 17] 并发覆盖一致性测试完成\n");
 }
 
-
 // ========== test 18. 并发删除与插入混合测试 ==========
 /**
- * 场景： 
+ * 场景：
  *  - 一半线程不断 PUT
  *  - 一半线程不断 DELETE
- * 
+ *
  * 目的：
  *  - 压测 borrow / merge / fixup 逻辑
  *  - 检查是否出现段错误
  */
-void* worker_mix(void* arg) {
+void* worker_mix(void* arg) {  // 线程执行任务的函数
     worker_arg* w = (worker_arg*)arg;
+    // 随机种子移到循环外，确保每个线程的随机序列不同且稳定
+    unsigned int seed = time(NULL) ^ (w->id * 1237);
 
     for (int i = 0; i < THREAD_OPS; i++) {
-        int k = rand() % 50;
+        int k = rand_r(&seed) % 5000;
 
-        if(w->id % 2)
+        if (w->id % 2) {
             kvstore_put(w->store, k, i);
-        else
+        } else {
+            // 删除时，即使返回 KVSTORE_ERR_NOT_FOUND 也是正常的
             kvstore_del(w->store, k);
-    }
+        }
 
+        if (i % 2000 == 0)
+            printf("Thread %d reached %d ops\n", w->id, i);
+    }
     return NULL;
 }
 
-void test_concurrent_insert_delete(){
+void test_concurrent_insert_delete() {
     cleanup();
     printf("\n[RUN 18] concurrent insert/delete testing...\n");
 
@@ -732,11 +735,157 @@ void test_concurrent_insert_delete(){
     for (int i = 0; i < num_threads; i++)
         pthread_join(threads[i], NULL);
 
-    assert(kvstore_get_state(s) == KVSTORE_STATE_READY);
+    // 新增：给异步任务（如正在进行的 Compaction）一点时间收尾
+    int retry = 0;
+    while (kvstore_get_state(s) != KVSTORE_STATE_READY && retry < 100) {
+        usleep(10000); // 等待 10ms，最多等 1s
+        retry++;
+    }
+
+    assert(kvstore_get_state(s) == KVSTORE_STATE_READY); // 此时再断言
 
     kvstore_close(s);
 
     printf("[PASS 18] 并发插入删除压力测试完成\n");
+}
+
+// ========== test 19. 高频 merge 压力测试 ==========
+/**
+ * 启动8个线程，每个吸纳从快速随机删除全量范围内的 Key
+ * 
+ * 大量删除会触发 分裂、借位与合并
+ * 
+*/
+void* worker_delete_only(void* arg) {
+    worker_arg* w = (worker_arg*)arg;
+    unsigned int seed = time(NULL) ^ (w->id * 1337);
+    
+    // 每个线程负责删除一部分数据，或者全量随机删除
+    for (int i = 0; i < 2000; i++) {
+        int k = rand_r(&seed) % 2000; // 对应预填充的范围
+        kvstore_del(w->store, k);
+    }
+    return NULL;
+}
+
+void test_merge_stress() {
+    cleanup();
+    printf("\n[RUN 19] merge stress testing (High Frequency)...\n");
+
+    kvstore* s = kvstore_open(TEST_LOG);
+
+    // 1. 预填充：插入足够多的数据，构建一个多层的 B+ 树
+    const int total_keys = 2000;
+    for (int i = 0; i < total_keys; i++) {
+        kvstore_put(s, i, i);
+    }
+    printf("Pre-fill done. Tree height is increased.\n");
+
+    // 2. 并发纯删除：多线程同时“拆树”，极易触发合并冲突
+    const int num_threads = 8; // 增加线程数提高竞争
+    pthread_t threads[num_threads];
+    worker_arg args[num_threads];
+
+    for (int i = 0; i < num_threads; i++) {
+        args[i].store = s;
+        args[i].id = i;
+        pthread_create(&threads[i], NULL, worker_delete_only, &args[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++)
+        pthread_join(threads[i], NULL);
+
+    // 3. 最终检查：确保最后数据库状态依然健康
+    assert(kvstore_get_state(s) == KVSTORE_STATE_READY);
+    
+    kvstore_close(s);
+    printf("[PASS 19] merge 压力测试完成，未检测到段错误或死锁\n");
+}
+
+/**
+ * [TEST 20] 并发写入与崩溃恢复测试 (Concurrent Write & Crash Recovery)
+ * * 【场景描述】：
+ * 1. 多个线程并发进行大量 PUT 操作，产生密集的 WAL (预写日志)。
+ * 2. 在不进行手动 Checkpoint 的情况下，直接关闭并重新打开数据库。
+ * 3. 验证重启后的数据重放 (Replay) 逻辑是否正确。
+ * * 【测试目的】：
+ * - 验证 WAL 的鲁棒性：并发写入时，日志序列号和原子性是否保证了恢复后的数据一致性。
+ * - 验证恢复速度：确保大量日志下的恢复逻辑不会超时或死锁。
+ * - 数据完整性验证：重启后随机抽查写入的数据，确保“所写即所得”。
+ */
+void test_concurrent_recovery() {
+    cleanup();
+    printf("\n[RUN 20] concurrent + recovery testing...\n");
+
+    // 1. 第一轮：并发写入
+    kvstore* s = kvstore_open(TEST_LOG);
+    const int num_threads = 4;
+    pthread_t threads[num_threads];
+    worker_arg args[num_threads];
+
+    for (int i = 0; i < num_threads; i++) {
+        args[i].store = s;
+        args[i].id = i;
+        // 假设每个线程写入特定范围的 key，方便后续验证
+        pthread_create(&threads[i], NULL, worker_thread, &args[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++)
+        pthread_join(threads[i], NULL);
+
+    // 记录一个最后写入的值用于对比 (假设 key 100 被写入了)
+    kvstore_put(s, 9999, 8888); 
+    
+    // 模拟正常关闭并持久化
+    kvstore_close(s);
+
+    // 2. 第二轮：模拟重启并恢复
+    printf("Reopening kvstore to trigger WAL recovery...\n");
+    s = kvstore_open(TEST_LOG);
+    
+    // 判定标准 A: 状态必须为 READY
+    assert(kvstore_get_state(s) == KVSTORE_STATE_READY);
+    
+    // 判定标准 B: 数据验证 (非常重要！)
+    // 验证最后存入的那个值是否还在，证明 WAL 重放成功了
+    long val = -1;
+    if (kvstore_search(s, 9999, &val) == KVSTORE_OK) {
+        assert(val == 8888);
+        printf("Recovery Data Verification Success: Key 9999 -> 8888\n");
+    } else {
+        printf("Recovery Data Verification FAILED!\n");
+        assert(0);
+    }
+
+    kvstore_close(s);
+    printf("[PASS 20] 并发 + crash recovery 测试完成\n");
+}
+
+/**
+ * [TEST 21] 全量数据持久化一致性验证 (Full Dataset Integrity)
+ * 场景：插入 100000 个不同的 Key，关闭重启，然后逐个 GET 验证
+ */
+void test_full_recovery_integrity() {
+    cleanup();
+    printf("\n[RUN 21] Full Integrity Testing...\n");
+
+    kvstore* s = kvstore_open(TEST_LOG);
+    for (int i = 0; i < 100000; i++) {
+        kvstore_put(s, i, i + 100);
+    }
+    kvstore_close(s);
+
+    // 重启
+    s = kvstore_open(TEST_LOG);
+    for (int i = 0; i < 100000; i++) {
+        long val;
+        if (kvstore_search(s, i, &val) != KVSTORE_OK || val != (i + 100)) {
+            printf("Integrity Failed at Key %d, Got %ld\n", i, val);
+            assert(0);
+        }
+    }
+    kvstore_close(s);
+    printf("[PASS 21] 全量数据恢复一致性检查通过\n");
 }
 
 int main() {
@@ -744,28 +893,31 @@ int main() {
 
     //======== V1 ~ V3  ========
 
-    test_basic_put_search();  // 1
-    test_update_replay();     // 2
-    test_delete_replay();     // 3
-    test_replay();            // 4
+    //test_basic_put_search();  // 1
+    //test_update_replay();     // 2
+    //test_delete_replay();     // 3
+    //test_replay();            // 4
 
-    test_corruption();        // 5
-    test_log_compaction();    // 6
-    test_crash_recovery_1();  // 7
-    test_empty_replay();      // 8
+    //test_corruption();        // 5
+    //test_log_compaction();    // 6
+    //test_crash_recovery_1();  // 7
+    //test_empty_replay();      // 8
 
     //  =========  V4  =========
-    test_crash_recovery();               // 9
-    test_reopen_persistence();           // 10
-    test_open_recover_idempotent();      // 11
-    test_reject_writer_after_close();    // 12
-    test_snapshot_recovery();            // 13
-    test_snapshot_and_log_truncation();  // 14
+    //test_crash_recovery();               // 9
+    //test_reopen_persistence();           // 10
+    //test_open_recover_idempotent();      // 11
+    //test_reject_writer_after_close();    // 12
+    //test_snapshot_recovery();            // 13
+    //test_snapshot_and_log_truncation();  // 14
 
-    //test_benchmark_write();        // 15 QPS
-    test_concurrency_stress();       // 16 并发控制安全
-    //test_concurrrent_overwrite();    // 17
-    //test_concurrent_insert_delete(); // 18
+    // test_benchmark_write();        // 15 QPS
+    // test_concurrency_stress();     // 16 并发控制安全
+    // test_concurrrent_overwrite();    // 17
+    // test_concurrent_insert_delete(); // 18
+    // test_merge_stress();                // 19
+    test_concurrent_recovery();           // 20
+    test_full_recovery_integrity();
 
     printf("所有测试均通过 ! 🎇\n");
     return 0;

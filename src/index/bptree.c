@@ -1029,31 +1029,32 @@ static int bptree_merge_leaf(bptree* tree, bptree_node* left, bptree_node* right
 static void bptree_merge_internal(bptree_node* parent, bptree_node* left, bptree_node* right, int parent_key_idx) {
     int old_left_count = left->key_count;
 
-    // 1. 【核心】父节点键下沉
-    // 父节点的 keys[parent_key_idx] 降级为 left 的一个键
+    // 1. 下沉父节点键
     left->keys[old_left_count] = parent->keys[parent_key_idx];
 
-    // 2. 拷贝右兄弟的键
-    // 注意：起始位置是 old_left_count + 1
+    // 2. 拷贝右兄弟的键（确保不越界）
     if (right->key_count > 0) {
         memcpy(&left->keys[old_left_count + 1], right->keys,
                sizeof(int) * right->key_count);
     }
 
     // 3. 拷贝右兄弟的孩子指针
-    // 内部节点有 key_count + 1 个孩子
+    // 关键点：right 有 key_count + 1 个孩子，它们都要搬过去
     memcpy(&left->children[old_left_count + 1], right->children,
            sizeof(bptree_node*) * (right->key_count + 1));
 
-    // 4. 更新搬过来的盖子们的 parent 指针
+    // 4. 更新所有搬过来的孩子的 parent 指针
     for (int i = 0; i <= right->key_count; i++) {
         if (left->children[old_left_count + 1 + i]) {
             left->children[old_left_count + 1 + i]->parent = left;
         }
     }
 
-    // 5. 更新计数: 新计数 = 原左 + 1（下沉键）+ 原右
+    // 5. 更新计数
     left->key_count += (right->key_count + 1);
+    
+    // 6. 清理 right 的引用，防止误用
+    right->key_count = 0;
 }
 
 /**
@@ -1090,7 +1091,7 @@ int bptree_delete_from_leaf(bptree* tree, bptree_node* leaf, int key) {
 
     // 2. 若没找到
     if (idx == leaf->key_count) {
-        printf("key %d 不存在！\n", key);
+        // printf("key %d 不存在！\n", key);
         return BPTREE_NOT_FOUND;  // todo
     }
 
@@ -1172,68 +1173,73 @@ static void bptree_delete_from_internal(bptree_node* node, int key_idx) {
 void bptree_fix_leaf(bptree* tree, bptree_write_path* path, bptree_node* leaf) {
     if (path->top <= 0) return;  // 到达根节点，无需修复
 
-    // 1. 从 path 栈获取父节点（此时父节点被 wrlock 锁住）
     bptree_node* parent = path->nodes[path->top - 1];
     int idx = bptree_find_child_index(parent, leaf);
 
-    // 2. 尝试从左兄弟借
+    // 1. 尝试从左兄弟借
     if (idx > 0) {
         bptree_node* left = parent->children[idx - 1];
-        pthread_rwlock_wrlock(&left->latch);  // 锁住左兄弟
-        if (left->key_count > MIN_KEYS) {
-            // 参数：parent, 左兄弟, 当前叶子, 分割它们的 key 索引 (idx-1)
-            bptree_borrow_from_left_leaf(parent, left, leaf, idx - 1);
+        // 【改进】使用 trylock 规避横向死锁。如果拿不到，说明有竞争，尝试别的方案
+        if (pthread_rwlock_trywrlock(&left->latch) == 0) {
+            if (left->key_count > MIN_KEYS) {
+                bptree_borrow_from_left_leaf(parent, left, leaf, idx - 1);
+                pthread_rwlock_unlock(&left->latch);
+                return; // 修复完成
+            }
             pthread_rwlock_unlock(&left->latch);
-            return;
         }
-        pthread_rwlock_unlock(&left->latch);
     }
 
-    // 3. 尝试从右兄弟借
+    // 2. 尝试从右兄弟借
     if (idx < parent->key_count) {
         bptree_node* right = parent->children[idx + 1];
-        pthread_rwlock_wrlock(&right->latch);
-
-        if (right->key_count > MIN_KEYS) {
-            // 参数：parent, 当前叶子, 右兄弟, 分割它们的 key 索引 (idx)
-            bptree_borrow_from_right_leaf(parent, leaf, right, idx);
+        if (pthread_rwlock_trywrlock(&right->latch) == 0) {
+            if (right->key_count > MIN_KEYS) {
+                bptree_borrow_from_right_leaf(parent, leaf, right, idx);
+                pthread_rwlock_unlock(&right->latch);
+                return; // 修复完成
+            }
             pthread_rwlock_unlock(&right->latch);
-            return;
         }
-        pthread_rwlock_unlock(&right->latch);
     }
 
-    // 4. 借不到则进行合并（Merge）
+    // 3. 借不到则合并 (Merge)
     if (idx > 0) {
-        // 有左兄弟：把 leaf 合并进 left
         bptree_node* left = parent->children[idx - 1];
-        pthread_rwlock_wrlock(&left->latch);
+        pthread_rwlock_wrlock(&left->latch); // 合并必须拿到锁
 
-        bptree_merge_leaf(tree, left, leaf);           // 合并到 left, leaf 被废弃
-        bptree_delete_from_internal(parent, idx - 1);  // // 从父节点删除 keys[idx-1] 和 children[idx]
+        bptree_merge_leaf(tree, left, leaf); 
+        bptree_delete_from_internal(parent, idx - 1);
 
         pthread_rwlock_unlock(&left->latch);
 
-        // 物理销毁被吞噬的 leaf
-        pthread_rwlock_destroy(&leaf->latch);
-        free(leaf);
+        // 【核心修正】不要在这里 free(leaf)！
+        // 因为 leaf 还在外层的 path 栈里。我们标记它，让外层释放。
+        // 或者在这里手动从 path 栈中移除它并释放。
+        for (int i = 0; i < path->top + 1; i++) {
+            if (path->nodes[i] == leaf) {
+                pthread_rwlock_unlock(&leaf->latch);
+                pthread_rwlock_destroy(&leaf->latch);
+                free(leaf);
+                path->nodes[i] = NULL; // 防止重复解锁
+                break;
+            }
+        }
     } else {
-        // 只有右兄弟：把 right 合并进 leaf
         bptree_node* right = parent->children[idx + 1];
         pthread_rwlock_wrlock(&right->latch);
 
-        bptree_merge_leaf(tree, leaf, right);    // 合并到 leaf, right 被废弃
-        bptree_delete_from_internal(parent, 0);  // 从父节点删除 keys[0] 和 children[1]
+        bptree_merge_leaf(tree, leaf, right);
+        bptree_delete_from_internal(parent, 0);
 
         pthread_rwlock_unlock(&right->latch);
 
-        // 物理销毁被吞噬的 right
+        // 销毁被吞噬的右节点 (右节点不在 path 栈里，可以安全销毁)
         pthread_rwlock_destroy(&right->latch);
         free(right);
     }
 
-    // 5. 递归修复父节点
-    // 如果 parent 发生了下溢，继续向上回溯
+    // 4. 递归修复父节点 (逻辑保持不变，但需确保 fix_internal 同样遵循锁契约)
     if (parent != tree->root && bptree_is_underflow(tree, parent)) {
         bptree_delete_fixup(tree, path, parent);
     }
@@ -1258,67 +1264,76 @@ void bptree_fix_leaf(bptree* tree, bptree_write_path* path, bptree_node* leaf) {
  *
  */
 void bptree_fix_internal(bptree* tree, bptree_write_path* path, bptree_node* node) {
-    if (path->top <= 0) return;  // 到达根节点，无需修复
+    if (!tree || !node || path->top <= 0) return;  // 到达根节点，无需修复
 
-    // 1. 从 path 栈获取已经加锁的父节点
     bptree_node* parent = path->nodes[path->top - 1];
     int idx = bptree_find_child_index(parent, node);
 
-    // 2. 尝试从左兄弟借
+    // 1. 尝试从左兄弟借
     if (idx > 0) {
         bptree_node* left = parent->children[idx - 1];
-        pthread_rwlock_wrlock(&left->latch);
-        if (left->key_count > MAX_KEYS / 2) {
-            bptree_borrow_from_left_internal(parent, left, node, idx - 1);
+        // 【改进】使用 trylock 降低死锁概率
+        if (pthread_rwlock_trywrlock(&left->latch) == 0) {
+            if (left->key_count > MAX_KEYS / 2) {
+                bptree_borrow_from_left_internal(parent, left, node, idx - 1);
+                pthread_rwlock_unlock(&left->latch);
+                return;
+            }
             pthread_rwlock_unlock(&left->latch);
-            return;
         }
-        pthread_rwlock_unlock(&left->latch);
     }
 
-    // 3. 尝试从右兄弟借
+    // 2. 尝试从右兄弟借
     if (idx < parent->key_count) {
         bptree_node* right = parent->children[idx + 1];
-        pthread_rwlock_wrlock(&right->latch);
-        if (right->key_count > MAX_KEYS / 2) {
-            bptree_borrow_from_right_internal(parent, node, right, idx);
+        if (pthread_rwlock_trywrlock(&right->latch) == 0) {
+            if (right->key_count > MAX_KEYS / 2) {
+                bptree_borrow_from_right_internal(parent, node, right, idx);
+                pthread_rwlock_unlock(&right->latch);
+                return;
+            }
             pthread_rwlock_unlock(&right->latch);
-            return;
         }
-        pthread_rwlock_unlock(&right->latch);
     }
 
-    // 4. 借不到则执行合并（Merge）
+    // 3. 借不到则执行合并 (Merge)
     if (idx > 0) {
-        // 与左兄弟合并：node 被并入 left
+        // 与左兄弟合并
         bptree_node* left = parent->children[idx - 1];
         pthread_rwlock_wrlock(&left->latch);
 
         bptree_merge_internal(parent, left, node, idx - 1);
-        bptree_delete_from_internal(parent, idx - 1);  // 从父节点摘除 node
+        bptree_delete_from_internal(parent, idx - 1);
 
         pthread_rwlock_unlock(&left->latch);
 
-        // 安全销毁 node
-        // 此处 free(node),要确保 free 之后不能让 unlock_all_in_path 尝试去解这个锁
-        pthread_rwlock_unlock(&node->latch);
-        pthread_rwlock_destroy(&node->latch);
-        free(node);
+        // 【核心修正】安全移除栈中节点，防止外层重复解锁导致崩溃
+        // 我们通过遍历找到 node 在 path 中的位置，清理它
+        for (int i = 0; i < MAX_TREE_LEVEL; i++) {
+            if (path->nodes[i] == node) {
+                pthread_rwlock_unlock(&node->latch);
+                pthread_rwlock_destroy(&node->latch);
+                free(node);
+                path->nodes[i] = NULL; // 标记为空，通知外层释放函数跳过
+                break;
+            }
+        }
     } else {
-        // 与右兄弟合并：right 被并入 node
+        // 与右兄弟合并 (right 被并入 node)
         bptree_node* right = parent->children[idx + 1];
         pthread_rwlock_wrlock(&right->latch);
 
         bptree_merge_internal(parent, node, right, idx);
-        bptree_delete_from_internal(parent, idx);  // 从父节点摘除 right
+        bptree_delete_from_internal(parent, idx);
 
         pthread_rwlock_unlock(&right->latch);
+
+        // right 不在 path 栈中，可以安全销毁
         pthread_rwlock_destroy(&right->latch);
         free(right);
     }
 
-    // 5. 递归向上修复
-    // 注意：root 缩高的逻辑我们已经统一放在 bptree_delete 的末尾处理了，这里只需处理普通下溢
+    // 4. 递归向上修复
     if (parent != tree->root && bptree_is_underflow(tree, parent)) {
         bptree_delete_fixup(tree, path, parent);
     }
@@ -1354,13 +1369,22 @@ void bptree_delete_fixup(bptree* tree, bptree_write_path* path, bptree_node* nod
         return;
     }
 
+    // 检查是否已经是根节点，根节点的收缩在 指挥官函数 bptree_delete 中处理
+    if (node->parent == NULL) {
+        return;
+    }
+
     // 2. 【关键】弹栈逻辑
     // 在进入此函数前，path->nodes[path->top-1] 指向的是 node 本身。
     // 为了让 fix_leaf/internal 能够通过 path->nodes[path->top-1] 访问到 parent，
     // 必须在这里弹出 node。
-    if (path->nodes[path->top - 1] == node) {
-        path->top--;
+
+    if (path->nodes[path->top - 1] != node) {
+        // 理论上不应进入此分支，若进入说明调用栈逻辑有误
+        return;
     }
+    path->top--;
+    
 
     // 3. 根据节点类型分流
     if (node->is_leaf) {
@@ -1394,7 +1418,14 @@ void bptree_delete_fixup(bptree* tree, bptree_write_path* path, bptree_node* nod
  * 该函数不会向上加锁，因此不会死锁。
  */
 static bptree_node* bptree_find_leaf_delete_safe(bptree* tree, int key, bptree_write_path* path) {
+    if (!tree) return NULL;
+
     pthread_mutex_lock(&tree->root_lock);
+    if (tree->root == NULL) {
+        pthread_mutex_unlock(&tree->root_lock);
+        return NULL;
+    }
+
     bptree_node* curr = tree->root;
     pthread_rwlock_wrlock(&curr->latch);
     pthread_mutex_unlock(&tree->root_lock);
@@ -1450,7 +1481,7 @@ int bptree_delete(bptree* tree, int key) {
 
     // 2. 叶子删除
     int ret = bptree_delete_from_leaf(tree, leaf, key);
-    if (ret != BPTREE_OK) {  // [改动2] 如果没删掉（Key不存在），直接解锁并退出
+    if (ret != BPTREE_OK) { 
         bptree_unlock_all_in_path(&path);
         return ret;
     }
@@ -1465,24 +1496,22 @@ int bptree_delete(bptree* tree, int key) {
     // 逻辑：如果原来的 root 变成空的 internal node，则要把它的第一个孩子提升为新 root
 
     pthread_mutex_lock(&tree->root_lock);
-    if (tree->root->key_count == 0 && !tree->root->is_leaf) {
-        bptree_node* old_root = tree->root;
-
-        // 提升孩子
+    bptree_node* current_root = tree->root;
+    
+    // 如果根节点不是叶子且没有键（说明在 fixup 中被合并空了）
+    if (current_root && !current_root->is_leaf && current_root->key_count == 0) {
+        bptree_node* old_root = current_root;
         tree->root = old_root->children[0];
         if (tree->root) tree->root->parent = NULL;
 
-        // 【重要改动】：安全解锁
-        // 不能直接断定 path.nodes[0] 就是 old_root
-        // 应该遍历整个 path 栈，如果 old_root 在里面，就置为 NULL
+        // 处理 path 栈中对 old_root 的持有，防止重复 unlock 或销毁已锁节点
         for (int i = 0; i < path.top; i++) {
             if (path.nodes[i] == old_root) {
                 pthread_rwlock_unlock(&old_root->latch);
-                path.nodes[i] = NULL;
-                break;
+                path.nodes[i] = NULL; // 标记已处理
             }
         }
-
+        
         pthread_rwlock_destroy(&old_root->latch);
         free(old_root);
     }

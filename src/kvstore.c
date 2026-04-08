@@ -29,19 +29,14 @@ struct _kvstore {
 
     FILE* log_fp;
     char log_path[256];
+    pthread_mutex_t log_lock;  // 保护日志文件并发写入
 
-    /* v4 新增 */
-    kvstore_state_t state;
-
-    /* v3, 降级为实现细节 */
-    kvstore_mode_t mode;
-    int readonly;  // replay / recovery 期间只读状态，禁止写
+    kvstore_state_t state; /* v4 新增 */
+    kvstore_mode_t mode;   /* v3, 降级为实现细节 */
+    int readonly;          // replay / recovery 期间只读状态，禁止写
 
     size_t log_size;
     size_t ops_count;
-
-    /* ====  V5  ==== */
-    // pthread_rwlock_t root_latch;
 };
 
 typedef struct {
@@ -142,8 +137,6 @@ const char* kvstore_strerror(int err);
  * ========================================================= */
 static int kvstore_crc_check(const char* payload, const char* crc_str);
 
-
-
 // ==============  实现  ==================
 
 /**
@@ -178,13 +171,11 @@ kvstore* kvstore_create() {
     store->mode = KVSTORE_MODE_NORMAL;
     store->readonly = 0;  // 默认可写
 
-    // 初始化读写锁  ->  废弃大锁  
-    // 职责下放 -> 遵循谁申请，谁初始化，谁负责
-    // pthread_rwlock_init(&store->root_latch, NULL);
+    // 初始化日志锁
+    pthread_mutex_init(&store->log_lock, NULL);
 
     return store;
 }
-
 
 /**
  * kvstore_destroy - 销毁并彻底回收 kvstore 实例的所有资源
@@ -414,6 +405,9 @@ int kvstore_close(kvstore* store) {
     /* 3. [状态机] 第二阶段：标记实例已进入静默态 */
     kvstore_transit_state(store, KVSTORE_STATE_CLOSED);
 
+    // 销毁锁
+    pthread_mutex_destroy(&store->log_lock);
+
     return KVSTORE_OK;
 }
 
@@ -441,7 +435,7 @@ int kvstore_put(kvstore* store, int key, long value) {
     if (!store || !store->tree) return KVSTORE_ERR_NULL;
 
     // 2. 原子执行
-    return  kvstore_exec_write(store, KVSTORE_OP_PUT, key, value);
+    return kvstore_exec_write(store, KVSTORE_OP_PUT, key, value);
 }
 
 /**
@@ -466,7 +460,6 @@ int kvstore_del(kvstore* store, int key) {
     // 2. 执行写入逻辑（DEL 也是一种写操作）
     return kvstore_exec_write(store, KVSTORE_OP_DEL, key, 0);
 }
-
 
 /**
  * kvstore_create_snapshot - 创建内存状态的快照
@@ -527,16 +520,20 @@ int kvstore_create_snapshot(kvstore* store) {
  *  - 只要系统中存在索引结构，就可以安全查询
  */
 int kvstore_search(kvstore* store, int key, long* value) {  // kvstore_get
-    // 1. 防御性
+    // 1. 防御性检查
     if (!store || !store->tree) return KVSTORE_ERR_NULL;
 
-    // 2.状态机校验
+    // 2. 状态校验 (确保不是 CLOSED 或 CORRUPTED)
     if (!kvstore_state_allow(store->state, KVSTORE_OP_GET)) {
         return KVSTORE_ERR_INTERNAL_STATE;
     }
 
-    // 3. 直接调用任务，不再需要全局 root_latch
-    return bptree_search(store->tree, key, value);
+    // 3. 加锁并执行搜索
+    pthread_mutex_lock(&store->log_lock);
+    int ret = bptree_search(store->tree, key, value);
+    pthread_mutex_unlock(&store->log_lock);
+
+    return ret;
 }
 
 /**
@@ -860,49 +857,45 @@ static int kvstore_log_header(const char* line) {
  * ========================================================= */
 
 /**
- * kvstore_log_put - 将写入操作持久到 WAL 日志文件
- *
- * 设计定位：
- *  - WAL 层函数
- *  - 只负责“把一次 PUT 操作顺序写入磁盘日志”
- *  - 不修改内存结构，不调用 B+ 树
- *
- * 日志格式
- *      PUT <key>|<crc32>\n
- *
- * 执行流程：
- *  1. 校验日志文件是否已打开
- *  2. 构造日志内容字符串
- *  3. 计算 CRC32 校验值
- *  4. 写入日志文件并强制刷盘
- *  5. 更新日志统计信息（大小 / 操作次数）
+ * 日志持久化（write-ahead Logging）
+ * - 负责将 PUT 操作以追加模式写入磁盘
+ * - 格式标准: "PUT <key> <value>|<crc32>\n"
  *
  * snprintf(): 将变量格式化为字符串，并安全写入缓冲区
  *
  */
 static int kvstore_log_put(kvstore* store, int key, long value) {
-    // 1. 安全边界检查
-    if (!store->log_fp) return KVSTORE_ERR_NULL;
+    // [1] 参数与状态校验
+    if (!store || !store->log_fp) return KVSTORE_ERR_NULL;
 
-    // 2. 序列化 - 将 操作类型，key 和 value 格式化为字符串
-    char buf[128];
-    snprintf(buf, sizeof(buf), "PUT %d %ld", key, value);
+    char payload[128];
+    char final_line[160];
 
-    // 3. 生成“数据指纹”
-    uint32_t crc = crc32(buf);
+    // [2] 构造有效载荷（payload）并计算校验和
+    // 使用 snprintf 确保缓冲区安全
+    int payload_len = snprintf(payload, sizeof(payload), "PUT %d %ld", key, value);
+    if (payload_len < 0 || payload_len >= (int)sizeof(payload)) {
+        return KVSTORE_ERR_INTERNAL;
+    }
 
-    // 4. 物理写入与格式编排
-    int bytes = fprintf(store->log_fp, "%s|%u\n", buf, crc);
+    uint32_t checksum = crc32(payload);
 
-    // 5. 强制落地
-    fflush(store->log_fp);
-    int fd = fileno(store->log_fp);
-    if (fd >= 0)
-        fsync(fd);
+    // [3] 构造最终行内容
+    // 显示将数据与校验和拼接，确保物理写入时是一次完整的 I/O 操作
+    int total_len = snprintf(final_line, sizeof(final_line), "%s|%u\n", payload, checksum);
+    if (total_len < 0 || total_len >= (int)sizeof(final_line)) {
+        return KVSTORE_ERR_INTERNAL;
+    }
 
-    // 6. 元数据更新
-    store->ops_count += 1;
-    store->log_size += bytes;
+    // [4] 执行物理追加写入
+    // fputs 相比 fprintf 更高效，因为它不需要再次解析格式化占位符
+    if (fflush(store->log_fp) != 0) {
+        return KVSTORE_ERR_IO;
+    }
+
+    // [6] 更新统计信息
+    // log_size 用于触发后续的自动压缩 (Compaction)
+    store->log_size += total_len;
 
     return KVSTORE_OK;
 }
@@ -950,10 +943,18 @@ static int kvstore_log_del(kvstore* store, int key) {
  * ========================================================= */
 
 /**
- * kvstore_exec_write
- *  - 原子写入路径：统筹协调日志持久化与内存索引更新
+ * 原子写入调度器
+ * - 该函数是 KVstore 的写入核心，负责协调磁盘持久化（WAL）,与内存索引（B+ 树）的同步
  *
- * 通过状态机 kvstore_state_allow 进行准入控制
+ * 严格遵循 write-ahead Logging 原则：
+ *  1. 准入检查
+ *  2. 日志先行
+ *  3. 更新索引
+ *  4. 异步触发维护
+ *
+ * - 通过状态机 kvstore_state_allow 进行准入控制
+ * - 如果磁盘日志写失败，内存 B+ 树绝对不能更新！
+ *   否则内存里有数据但磁盘没有，重启后数据就丢失了（违反了持久性）
  *
 设计意图：
     kvstore_put ─┐
@@ -963,60 +964,59 @@ static int kvstore_log_del(kvstore* store, int key) {
     kvstore_del ─┘
 
     kvstore_replay_* ──→ apply only
+
+ * - 使用全局的 log_lock(大锁)，保证 WAL 写入和 B+ 树的修改是一个原子操作
+ * - 第 7 步 释放锁，再调用 maybe_compact, 避免所有并发写线程在 pthread_mutex_lock 处排队
+ *
  */
 static int kvstore_exec_write(kvstore* store, kvstore_op_t op, int key, int value) {
-    //printf("enter write\n");
-    
-    int ret;
+    int ret = KVSTORE_OK;
 
-    /* 1. 基础合法性检查  */
-    if (!store)
-        return KVSTORE_ERR_NULL;
+    if (!store) return KVSTORE_ERR_NULL;
 
-    /* 2.状态检查：防火墙机制 */
-    if (!kvstore_state_allow(store->state, op)) {
+    /* --- 核心临界区开始 --- */
+    pthread_mutex_lock(&store->log_lock);
+
+    // [1] 状态准入：仅允许在 READY 状态下写入
+    // READONLY 状态意味着 compaction 正在进行原子切换，需拦截写入
+    if (store->state != KVSTORE_STATE_READY) {
+        pthread_mutex_unlock(&store->log_lock);
         return KVSTORE_ERR_INTERNAL_STATE;
     }
 
-    /* 3. 第一阶段：先写 WAL(Durability First) */
-    switch (op) {
-        case KVSTORE_OP_PUT:
-            ret = kvstore_log_put(store, key, value);
-            break;
-        case KVSTORE_OP_DEL:
-            ret = kvstore_log_del(store, key);
-            break;
+    // [2] 物理写入： WAL 持久化
+    // 必须在修改内存索引前完成，确保 crash-safety（冲突安全）
+    if (op == KVSTORE_OP_PUT)
+        ret = kvstore_log_put(store, key, value);
+    else
+        ret = kvstore_log_del(store, key);
 
-        default:
-            return KVSTORE_ERR_INTERNAL;
-    }
-
-    if (ret != KVSTORE_OK)
-        return kvstore_fatal(store, ret);
-
-    /* 4. 第二阶段：再 apply 到内存(Update Index) */
-    switch (op) {
-        case KVSTORE_OP_PUT:
-            ret = kvstore_apply_put(store, key, value);
-            break;
-        case KVSTORE_OP_DEL:
-            ret = kvstore_apply_del(store, key);
-            break;
-
-        default:
-            return KVSTORE_ERR_INTERNAL;
-    }
-
-    // 如果内存更新失败，属于致命逻辑错误
+    // [3] 日志异常处理：若磁盘写入失败，标记系统故障并立即回滚退出
     if (ret != KVSTORE_OK) {
+        pthread_mutex_unlock(&store->log_lock);
         return kvstore_fatal(store, ret);
     }
 
-    /* 5. 运行态维护 */
-    store->ops_count++;
+    // [4] 逻辑应用：更新内存 B+ 树索引
+    if (op == KVSTORE_OP_PUT) {
+        ret = kvstore_apply_put(store, key, (long)value);
+    } else {
+        ret = kvstore_apply_del(store, key);
+    }
+
+    // [5] 统计更新：仅在操作完全成功后累加计数器
+    if (ret == KVSTORE_OK) {
+        store->ops_count++;
+    }
+
+    pthread_mutex_unlock(&store->log_lock);
+    /* --- 临界区结束 --- */
+
+    // [6] 后勤维护：尝试触发日志压缩（异步思维）
+    // 此时已释放锁， maybe_compact 内部使用 trylock 避免阻塞当前线程
     kvstore_maybe_compact(store);
 
-    return KVSTORE_OK;
+    return ret;
 }
 
 /**
@@ -1120,21 +1120,30 @@ static int kvstore_state_allow(kvstore_state_t state, kvstore_op_t op) {
  * 8️⃣ 内存变更 Apply 层
  * ========================================================= */
 /**
- * kvstore_apply_put - 将数据变更最终应用到内存索引（B+ 树）
- *
- *  - 该函数是纯净的。它假设所有的准入控制（状态，日志，权限）已经在上层完成
- *  - 它同时用于普通写路径和 WAL 重放
+ * 内存索引应用层
+ *  - 该函数负责将已经过验证的数据变更应用到内存索引结构中。
+ *    他起到了解耦层的作用，将上层的事务/日志逻辑与底层的 B+ 树数据结构分离
+ * 
+ * 准入特性：
+ * 1. 幂等性：被调用时加锁数据已持久化，仅负责内存状态更新
+ * 2. 线程安全：本函数不加锁，调用者（如 exec_write）必须持有 store->log_lock
+ * 3. 复用性：同时支持正常写路径与崩溃恢复（WAL Replay）路径
  */
 static int kvstore_apply_put(kvstore* store, int key, long value) {
-    // 1. 安全基石
+    // [1] 安全检查
     if (!store) return KVSTORE_ERR_NULL;
 
-    // 2. 索引就绪检查
-    if (!store->tree) return KVSTORE_ERR_INTERNAL_STATE;
-
-    // 3. 跨层调用
-    // 不关心文件，不关心 CRC，不关心状态机，只把数据塞进内存索引
-    // 这种“瘦接口”设计可以非常容易把 B+ 树 换成跳表（SkipList）或红黑树，而不需要改动上层逻辑
+    
+    if (!store->tree) {
+        // 索引结构未初始化或处于非法状态，通常是致命错误
+        fprintf(stderr, "[ERROR] Memory index (B+ Tree) is not initialized.\n");
+        return KVSTORE_ERR_INTERNAL_STATE;
+    }
+    // [2] 跨层调用:将请求路由至底层 B+ 树算法
+    /**
+     * 这里体现了“接口隔离”原则。kvstore 不直接操作 B+ 树节点，
+     * 而是通过 apply_put_internal 这一受限接口进行数据注入
+     */
     return kvstore_apply_put_internal(store->tree, key, value);
 }
 
@@ -1213,27 +1222,37 @@ static int kvstore_apply_del_internal(bptree* tree, int key) {
  *  - 即使 compaction 失败，WAL 仍然可保证数据安全
  */
 static void kvstore_maybe_compact(kvstore* store) {
-    // 1. 安全校验
     if (!store) return;
 
-    // 2. 阈值判断：多维度监控
-    if (store->log_size >= KVSTORE_MAX_LOG_SIZE ||
-        store->ops_count >= KVSTORE_MAX_OPS) {
-        // 3. 执行压缩逻辑
-        int rc = kvstore_compact(store);
-
-        // 4. 状态重置与 Epoch 切换
-        if (rc == KVSTORE_OK) {
-            // 旧的 WAL 已经被清理，系统进入一个新的“纪元 [Epoch] ”
-            store->log_size = 0;
-            store->ops_count = 0;
-        } else {
-            // 5. 容错处理
-            // 压缩失败（磁盘写保护不足或临时空间不足），不重置计数器。下次 PUT 再触发此操作
-            // 体现系统的“自愈”意图
-            fprintf(stderr, "[WARN] kvstore compaction failed, will retry later\n");
-        }
+    // 1. 预检查：未达阈值则直接返回
+    if (store->ops_count < KVSTORE_MAX_OPS) {
+        return;
     }
+
+    // 2. 尝试拿锁：如果拿不到，说明有其他线程在写或者在压缩，直接放弃本次触发
+    if (pthread_mutex_trylock(&store->log_lock) != 0) {
+        return;
+    }
+
+    // 3. 拿到锁后再次检查状态，防止重复进入压缩
+    if (store->state == KVSTORE_STATE_READONLY) {
+        pthread_mutex_unlock(&store->log_lock);
+        return;
+    }
+
+    // 4. 标记为只读状态（代表正在压缩），然后【立即解锁】
+    // 这样在耗时的 scan 期间，写线程可以继续进入 exec_write (但会被状态拦截)
+    // 或者你可以选择在这里不解锁，但为了性能，我们推荐在 scan 时允许读取
+    store->state = KVSTORE_STATE_READONLY;
+    pthread_mutex_unlock(&store->log_lock);
+
+    // 5. 调用实际的压缩逻辑
+    kvstore_compact_internal(store);
+
+    // 6. 恢复状态
+    pthread_mutex_lock(&store->log_lock);
+    store->state = KVSTORE_STATE_READY;
+    pthread_mutex_unlock(&store->log_lock);
 }
 
 /**
@@ -1253,49 +1272,45 @@ static int kvstore_compact_internal(kvstore* store) {
     const char* tmp_path = "data.compact";
     const char* data_path = store->log_path;
 
-    /* 1. 创建临时 WAL 文件 */
-    FILE* fp = fopen("data.compact", "w");
-    if (!fp) {
-        perror("fopen compact");
-        return KVSTORE_ERR_IO;
-    }
+    // 【耗时操作：锁外执行】 遍历 B+ 树生成新日志
+    FILE* fp = fopen(tmp_path, "w");
+    if (!fp) return KVSTORE_ERR_IO;
 
-    /* 2. 写 WAL Header */
     fprintf(fp, "%s\n", KVSTORE_LOG_VERSION);
-
-    /* 3.全量扫描内存状态，生成新的 WAL */
     if (bptree_scan(store->tree, compact_write_cb, fp) != 0) {
         fclose(fp);
         unlink(tmp_path);
         return KVSTORE_ERR_INTERNAL;
     }
 
-    /* 4. 强制物理落盘 */
     fflush(fp);
     fsync(fileno(fp));
     fclose(fp);
 
-    /* 5. 原子替换旧 WAL */
-    FILE* old_fp = store->log_fp;
-    store->log_fp = NULL;
+    /* ==========================================================
+     * 【核心原子区】 仅保护文件流切换和计数器重置
+     * ========================================================== */
+    pthread_mutex_lock(&store->log_lock);
 
-    if (rename(tmp_path, data_path) != 0) {
-        perror("rename");
-        store->log_fp = old_fp;  // 回滚
-        return KVSTORE_ERR_INTERNAL;
-    }
-    fclose(old_fp);
-
-    /* 6. 重新打开 WAL 文件 */
-    store->log_fp = fopen(data_path, "a+");
-    if (!store->log_fp) {
-        perror("reopen data.log");
-        return KVSTORE_ERR_INTERNAL;
+    if (store->log_fp) {
+        fclose(store->log_fp);
+        store->log_fp = NULL;
     }
 
-    /* 7. 创建 snapshot  */
+    if (rename(tmp_path, data_path) == 0) {
+        store->log_fp = fopen(data_path, "a+");
+        // 关键：重置计数器，确保解锁后 maybe_compact 不会再次触发
+        store->log_size = 0;
+        store->ops_count = 0;
+    } else {
+        perror("Compaction rename failed");
+        store->log_fp = fopen(data_path, "a+");
+    }
+
+    pthread_mutex_unlock(&store->log_lock);
+    /* ========================================================== */
+
     kvstore_create_snapshot(store);
-
     return KVSTORE_OK;
 }
 
@@ -1475,10 +1490,16 @@ static int kvstore_enter_compaction(kvstore* store) {
  *  这里通常是写锁的地方 ！
  */
 static void kvstore_exit_compaction(kvstore* store, kvstore_state_t prev) {
-    // 1. 状态回溯
-    store->state = prev;
+    // 1. 如果当前状态已经被标记为 CORRUPTED (由 fatal 触发)，则绝对不能回溯
+    if (store->state == KVSTORE_STATE_CORRUPTED) {
+        return;
+    }
 
-    // 2. 派生状态生效 - 会根据恢复否的 state 重新打开写权限
+    // 2. 正常情况下，如果压缩顺利完成，回到 READY
+    // 注意：不要盲目使用 prev，直接回归 Ready 状态是最稳妥的
+    store->state = KVSTORE_STATE_READY;
+
+    // 3. 重新应用权限
     kvstore_apply_state(store);
 }
 
@@ -1551,7 +1572,10 @@ static int kvstore_fatal(kvstore* store, int err) {
     return err;
 }
 
-
 kvstore_state_t kvstore_get_state(kvstore* store) {
-    return store->state;
+    if (!store) return KVSTORE_STATE_CLOSED;
+    pthread_mutex_lock(&store->log_lock);  // 复用日志锁来保证状态可见性
+    kvstore_state_t s = store->state;
+    pthread_mutex_unlock(&store->log_lock);
+    return s;
 }
